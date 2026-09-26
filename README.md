@@ -4,18 +4,23 @@
 
 A minimal, Bevy-inspired typed function runtime for AI agents. You write an
 ordinary Rust `async fn`. Its parameter types declare the dependencies,
-tools, and context it needs, and an `AgentWorld` prepares, validates, and runs
-it. There is no per-function adapter and no proc macro.
+tools, inputs, and context it needs, and an `AgentWorld` prepares, validates,
+and runs it. There is no per-function adapter and no proc macro.
+
+Context is part of that declaration. `Context<RelevantMemory<5>>` means
+"before this runs, retrieve up to 5 memories relevant to this invocation's
+task", and the runtime does that retrieval for every call.
 
 ```rust
 use worldfn::prelude::*;
 
 async fn researcher(
+    task: Input<Task>,
     llm: Llm,
     web: Tool<WebSearch>,
-    memory: Context<RelevantMemory>,
+    memory: Context<RelevantMemory<2>>,
 ) -> Answer {
-    let hits = web.call("bevy system params".into()).await?;
+    let hits = web.call(task.0.clone()).await?;
     // ...
 }
 
@@ -23,9 +28,11 @@ let mut world = AgentWorld::new();
 world
     .provide_llm(FakeLlm::with_answer("A concise answer"))?
     .provide_tool::<WebSearch>(FakeTool::with_response(search_results))?
-    .provide_context(RelevantMemory::new(["user likes Bevy"]))?;
+    .provide_memory(FakeMemory::new(["user likes Bevy", "user deploys with kubernetes"]))?;
 
-let answer = world.run(researcher).await?;
+let answer = world
+    .run_with(researcher, Scope::of(Task::new("How do Bevy system params work?")))
+    .await?;
 ```
 
 ## What you get from the signature
@@ -34,31 +41,50 @@ let answer = world.run(researcher).await?;
 
 ```text
 researcher
+├── reads Input<Task>
 ├── requires Llm
 ├── can call Tool<web_search>
-└── requires Context<RelevantMemory>
+└── requires Context<RelevantMemory<2>>
+    ├── requires Memory
+    └── reads Input<Task>
 
 Cannot prepare researcher:
+  · Input<Task>: checked when started
   ✓ Llm
   ✗ Tool<web_search>: no provider registered
-  ✗ Context<RelevantMemory>: no provider registered
+  ✗ Context<RelevantMemory<2>>: needs Memory
+
+task:    How do Bevy system params work?
+answer:  (fake) Known about the user: ["user likes Bevy's system params"]
+sources: ["https://docs.rs/bevy_ecs"]
+
+task:    Should the Rust agent runtime use kubernetes?
+answer:  (fake) Known about the user: ["user is building an agent runtime in Rust", "user deploys with kubernetes"]
+sources: ["https://docs.rs/bevy_ecs"]
+
+web_search requests: ["How do Bevy system params work?", "Should the Rust agent runtime use kubernetes?"]
 ```
 
-The first block comes from `researcher.into_agent().meta()` and needs no
-world. The second is the error from a world that has only an LLM. Missing
-dependencies are all reported at once, before the function body runs.
+The tree comes from `researcher.into_agent().meta()` and needs no world.
+The ✓/✗ report is the error from a world that has only an LLM: every
+missing binding is reported at once, before the function body runs. The two
+runs share one prepared agent, and each gets memory retrieved for its own
+task.
 
 ## API at a glance
 
 | Item | Purpose |
 |---|---|
-| `AgentWorld::provide`, `provide_llm`, `provide_tool::<T>`, `provide_context` | Bind a value to a logical requirement. Rejects duplicates. |
+| `AgentWorld::provide`, `provide_llm`, `provide_tool::<T>`, `provide_memory` | Bind a value to a logical requirement. Rejects duplicates. |
 | `AgentWorld::replace` | Rebind explicitly. Invalidates agents prepared earlier. |
-| `AgentWorld::run(f)` | One-shot: prepare, then run. |
-| `AgentWorld::prepare(f)` + `run_prepared(&mut agent)` | Initialize parameter state once, then run many times. |
-| `Llm`, `Tool<T: ToolSpec>`, `Context<T>`, `Res<T>`, `Option<P>`, tuples | Built-in parameters. |
+| `AgentWorld::run_with(f, scope)` / `run(f)` | One-shot: prepare, then run with this invocation's inputs. |
+| `AgentWorld::prepare(f)` + `run_prepared_with(&mut agent, scope)` | Initialize parameter state once, then run many times. |
+| `Scope::of(Task::new(..))` | Per-invocation inputs, read by `Input<T>`. |
+| `Llm`, `Tool<T: ToolSpec>`, `Memory`, `Res<T>`, `Input<T>`, `Option<P>`, tuples | Built-in parameters. |
+| `Context<S: ContextSource>` | Context materialized per invocation. `S::Deps` declares what building it needs; `materialize` may be `async`. |
+| `RelevantMemory<N>` | Built-in context: up to `N` entries from `Memory` for the `Input<Task>`. |
 | `AgentParam` | Implement it to add a parameter kind: `describe` / `init` / `resolve`. |
-| `FakeLlm`, `FakeTool<T>` | Deterministic fakes that record calls, for tests and examples. |
+| `FakeLlm`, `FakeTool<T>`, `FakeMemory` | Deterministic fakes that record calls, for tests and examples. |
 | `RunError` | Runtime failures only. The function's own `Result` stays nested: `.await??`. |
 
 Bevy mapping:
@@ -73,21 +99,24 @@ Bevy mapping:
 | `FunctionSystem` | `FunctionAgent` |
 | `SystemState` | `prepare` |
 
-## Limitations (M1)
+## Limitations
 
 - **Parameters are owned handles, not borrows from the world.** A borrowed
   parameter would make the future's type depend on a lifetime, which the
   `FnMut(P) -> Fut` bound cannot express. See `DESIGN.md`. As a result there
   is no `ResMut` or `Write<T>`; shared mutation needs interior mutability.
-- **Context is a pre-materialized snapshot.** Nothing is retrieved, ranked,
-  or budgeted per task yet.
-- **Resolution is synchronous.** The agent body is async.
+- **Retrieval is faked.** `FakeMemory` ranks by word overlap. There are no
+  token budgets, context caching, or provenance yet, and `N` counts entries,
+  not tokens.
+- **Inputs are checked at start, not at `prepare`.** They vary per
+  invocation. A missing input still fails before the body runs.
 - **Arity is 0–8.** Group parameters into tuples for more.
 - **Futures must be `Send`.** An agent that holds a `!Send` value across an
   `.await` shows up as an unsatisfied `IntoAgent` bound at `world.run`.
-- **Some dynamic dispatch.** LLM and tool providers are type-erased
-  (`Arc<dyn …>`, one boxed future per call). `Agent::start` boxes one future
-  per run.
+- **Some dynamic dispatch and boxing.** Providers are type-erased
+  (`Arc<dyn …>`, one boxed future per call). Each run boxes its future, plus
+  one future per tuple, `Option` or `Context` parameter. Tuple elements resolve
+  sequentially. No benchmarks have been run yet.
 - **There is one `Llm` per world.** Several models would need marker-typed
   handles such as `Llm<Fast>`.
 - **No real LLM provider, capability enforcement, graphs, or scheduler.**

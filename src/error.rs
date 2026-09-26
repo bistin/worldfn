@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::fmt;
 
+use crate::param::short_type_name;
 use crate::{AgentMeta, Requirement};
 
 /// A runtime-layer failure: the agent could not be prepared or started.
@@ -55,8 +56,17 @@ pub struct Diagnostics {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
+    /// The requirement as declared by the signature.
     pub requirement: Requirement,
-    pub satisfied: bool,
+    /// `None` if satisfied. Otherwise the unmet part: for a context, only
+    /// the needs that are missing.
+    pub unmet: Option<Requirement>,
+}
+
+impl Check {
+    pub fn satisfied(&self) -> bool {
+        self.unmet.is_none()
+    }
 }
 
 impl Diagnostics {
@@ -66,7 +76,7 @@ impl Diagnostics {
             .iter()
             .map(|requirement| Check {
                 requirement: requirement.clone(),
-                satisfied: !missing.contains(requirement),
+                unmet: missing.iter().find(|m| requirement.same_as(m)).cloned(),
             })
             .collect();
         Self {
@@ -75,10 +85,11 @@ impl Diagnostics {
         }
     }
 
+    /// The declared requirements that are not satisfied.
     pub fn missing(&self) -> impl Iterator<Item = &Requirement> {
         self.checks
             .iter()
-            .filter(|c| !c.satisfied)
+            .filter(|c| !c.satisfied())
             .map(|c| &c.requirement)
     }
 }
@@ -87,16 +98,22 @@ impl Diagnostics {
 /// Cannot prepare researcher:
 ///   ✓ Llm
 ///   ✗ Tool<web_search>: no provider registered
-///   ✓ Context<RelevantMemory>
+///   ✗ Context<RelevantMemory>: needs Memory
 /// ```
 impl fmt::Display for Diagnostics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Cannot prepare {}:", self.agent)?;
         for check in &self.checks {
-            if check.satisfied {
-                write!(f, "\n  ✓ {}", check.requirement)?;
-            } else {
-                write!(f, "\n  ✗ {}: no provider registered", check.requirement)?;
+            match &check.unmet {
+                None if matches!(check.requirement, Requirement::Input { .. }) => {
+                    write!(f, "\n  · {}: checked when started", check.requirement)?
+                }
+                None => write!(f, "\n  ✓ {}", check.requirement)?,
+                Some(Requirement::Context { needs, .. }) => {
+                    let needs: Vec<_> = needs.iter().map(ToString::to_string).collect();
+                    write!(f, "\n  ✗ {}: needs {}", check.requirement, needs.join(", "))?
+                }
+                Some(_) => write!(f, "\n  ✗ {}: no provider registered", check.requirement)?,
             }
         }
         Ok(())
@@ -115,7 +132,8 @@ impl fmt::Display for ParamError {
         write!(
             f,
             "parameter `{}` failed to resolve: {}",
-            self.param, self.message
+            short_type_name(self.param),
+            self.message
         )
     }
 }

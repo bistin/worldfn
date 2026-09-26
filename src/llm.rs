@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
 use std::fmt;
+use std::future::{Ready, ready};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::param::unmet;
-use crate::{AgentParam, AgentWorld, BoxFuture, ParamError, Requirement};
+use crate::{AgentParam, AgentWorld, BoxFuture, ParamError, Requirement, Scope};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmError(pub String);
@@ -45,6 +46,7 @@ impl Llm {
 
 impl AgentParam for Llm {
     type State = Llm;
+    type Future = Ready<Result<Self, ParamError>>;
 
     fn describe(out: &mut Vec<Requirement>) {
         out.push(Requirement::Llm);
@@ -54,8 +56,8 @@ impl AgentParam for Llm {
         world.resource::<Llm>().cloned().ok_or_else(unmet::<Self>)
     }
 
-    fn resolve(state: &mut Llm, _world: &AgentWorld) -> Result<Self, ParamError> {
-        Ok(state.clone())
+    fn resolve(state: &mut Llm, _world: &AgentWorld, _scope: &Scope) -> Self::Future {
+        ready(Ok(state.clone()))
     }
 }
 

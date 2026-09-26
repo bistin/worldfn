@@ -1,9 +1,10 @@
 use std::any::type_name;
 use std::fmt;
+use std::future::{Ready, ready};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::param::unmet;
-use crate::{AgentParam, AgentWorld, BoxFuture, ParamError, Requirement};
+use crate::{AgentParam, AgentWorld, BoxFuture, ParamError, Requirement, Scope};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolError(pub String);
@@ -58,6 +59,7 @@ impl<T: ToolSpec> Clone for Tool<T> {
 
 impl<T: ToolSpec> AgentParam for Tool<T> {
     type State = Tool<T>;
+    type Future = Ready<Result<Self, ParamError>>;
 
     fn describe(out: &mut Vec<Requirement>) {
         out.push(Requirement::Tool {
@@ -73,8 +75,8 @@ impl<T: ToolSpec> AgentParam for Tool<T> {
             .ok_or_else(unmet::<Self>)
     }
 
-    fn resolve(state: &mut Self::State, _world: &AgentWorld) -> Result<Self, ParamError> {
-        Ok(state.clone())
+    fn resolve(state: &mut Self::State, _world: &AgentWorld, _scope: &Scope) -> Self::Future {
+        ready(Ok(state.clone()))
     }
 }
 

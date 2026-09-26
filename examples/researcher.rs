@@ -23,41 +23,41 @@ async fn researcher(llm: Llm, web: Tool<WebSearch>, memory: Context<RelevantMemo
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() {
-    // The signature *is* the spec: inspect it before building any world.
-    println!("researcher needs:");
-    for requirement in researcher.into_agent().requirements() {
-        println!("  - {requirement}");
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The signature is the spec: inspect it before any world exists.
+    println!("{}\n", researcher.into_agent().meta());
+
+    // A partial world reports every requirement, satisfied or not.
+    let mut partial = AgentWorld::new();
+    partial.provide_llm(FakeLlm::new())?;
+    if let Err(err) = partial.prepare(researcher) {
+        println!("{err}\n");
     }
 
-    // An incomplete world reports everything that is missing at once.
-    let empty = AgentWorld::new();
-    if let Err(err) = empty.validate(researcher) {
-        println!("\n{err}");
-    }
-
+    let web = FakeTool::<WebSearch>::new(|query| {
+        Ok(vec![SearchHit {
+            title: format!("Results for {query}"),
+            url: "https://docs.rs/bevy_ecs".into(),
+            snippet: "SystemParam ...".into(),
+        }])
+    });
     let mut world = AgentWorld::new();
     world
-        .insert_llm(FakeLlm::responding(|prompt| {
+        .provide_llm(FakeLlm::responding(|prompt| {
             format!("(fake llm saw {} chars of prompt)", prompt.len())
-        }))
-        .insert_tool::<WebSearch>(FakeTool::new(|query| {
-            Ok(vec![SearchHit {
-                title: format!("Results for {query}"),
-                url: "https://docs.rs/bevy_ecs".into(),
-                snippet: "SystemParam ...".into(),
-            }])
-        }))
-        .insert(MemoryStore::new([
+        }))?
+        .provide_tool::<WebSearch>(web.clone())?
+        .provide_context(RelevantMemory::new([
             "user is building an agent runtime in Rust",
             "user likes Bevy's system params",
-            "user's cat is called Ferris",
-        ]))
-        .insert(Task::new("How do Bevy system params work in Rust?"));
+        ]))?;
 
-    let answer = world
-        .run(researcher)
-        .await
-        .expect("world satisfies researcher");
-    println!("\nanswer:  {}\nsources: {:?}", answer.text, answer.sources);
+    // Prepare once, run twice: parameter state is initialized a single time.
+    let mut agent = world.prepare(researcher)?;
+    for _ in 0..2 {
+        let answer = world.run_prepared(&mut agent).await?;
+        println!("answer:  {}\nsources: {:?}", answer.text, answer.sources);
+    }
+    println!("web_search requests: {:?}", web.requests());
+    Ok(())
 }

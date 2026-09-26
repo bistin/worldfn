@@ -1,13 +1,17 @@
+//! Tests are grouped by the "Required validation" list of the design brief.
+
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use worldfn::prelude::*;
-use worldfn::{FunctionAgent, LlmError, SearchHit, ToolError};
+use worldfn::{AgentMeta, BindError, FunctionAgent, LlmError, ParamError, SearchHit, ToolError};
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[derive(Debug, Clone, PartialEq)]
 struct Answer(String);
 
-/// The motivating example, verbatim signature.
+/// The target signature, verbatim.
 async fn researcher(llm: Llm, web: Tool<WebSearch>, memory: Context<RelevantMemory>) -> Answer {
     let hits = web.call("rust async".into()).await.expect("search");
     let sources: Vec<_> = hits.iter().map(|h| h.title.as_str()).collect();
@@ -23,246 +27,404 @@ fn hit(title: &str) -> SearchHit {
     }
 }
 
-fn research_world(llm: FakeLlm, web: FakeTool<WebSearch>) -> AgentWorld {
+fn research_world(
+    llm: FakeLlm,
+    web: FakeTool<WebSearch>,
+    memory: RelevantMemory,
+) -> Result<AgentWorld, BindError> {
     let mut world = AgentWorld::new();
     world
-        .insert_llm(llm)
-        .insert_tool::<WebSearch>(web)
-        .insert(MemoryStore::new([
-            "user prefers tokio over async-std",
-            "the cat is called Ferris",
-            "async rust futures are lazy",
-        ]))
-        .insert(Task::new("explain async rust futures"));
-    world
+        .provide_llm(llm)?
+        .provide_tool::<WebSearch>(web)?
+        .provide_context(memory)?;
+    Ok(world)
 }
 
+// 1. The target researcher runs using fakes, no network or API key.
 #[tokio::test]
-async fn runs_ordinary_async_fn_with_resolved_params() {
-    let llm = FakeLlm::scripted(["futures are lazy state machines"]);
-    let web = FakeTool::<WebSearch>::new(|q| {
-        assert_eq!(q, "rust async");
-        Ok(vec![hit("async-book")])
-    });
-    let world = research_world(llm.clone(), web.clone());
+async fn researcher_runs_on_fakes() -> TestResult {
+    let llm = FakeLlm::with_answer("futures are lazy");
+    let web = FakeTool::<WebSearch>::with_response(vec![hit("async-book")]);
+    let world = research_world(
+        llm.clone(),
+        web.clone(),
+        RelevantMemory::new(["prefers tokio"]),
+    )?;
 
-    let answer = world.run(researcher).await.unwrap();
+    let answer = world.run(researcher).await?;
 
-    assert_eq!(answer, Answer("futures are lazy state machines".into()));
-    assert_eq!(web.calls(), 1);
+    assert_eq!(answer, Answer("futures are lazy".into()));
+    assert_eq!(web.requests(), vec!["rust async".to_string()]);
     let prompts = llm.prompts();
     assert_eq!(prompts.len(), 1);
-    assert!(prompts[0].contains("async-book"));
-    assert!(prompts[0].contains("async rust futures are lazy"));
-    assert!(
-        !prompts[0].contains("Ferris"),
-        "irrelevant memory leaked: {}",
-        prompts[0]
-    );
+    assert!(prompts[0].contains("async-book") && prompts[0].contains("prefers tokio"));
+    Ok(())
 }
 
+// 2 + 7. Dependencies are declared in the signature only, and the metadata
+// matches it — no world needed.
 #[test]
-fn parameter_types_are_a_declarative_description() {
-    // No world needed: the signature alone describes the agent.
-    let requirements = researcher.into_agent().requirements();
+fn metadata_matches_signature() {
+    let agent = researcher.into_agent();
     assert_eq!(
-        requirements,
-        vec![
-            Requirement::Llm,
-            Requirement::Tool {
-                name: "web_search",
-                spec: std::any::type_name::<WebSearch>()
-            },
-            Requirement::Context {
-                type_name: std::any::type_name::<RelevantMemory>(),
-                needs: vec![
-                    Requirement::Resource {
-                        type_name: std::any::type_name::<MemoryStore>()
-                    },
-                    Requirement::Resource {
-                        type_name: std::any::type_name::<Task>()
-                    },
-                ],
-            },
-        ]
+        agent.meta(),
+        &AgentMeta {
+            name: "researcher".into(),
+            params: vec![
+                Requirement::Llm,
+                Requirement::Tool {
+                    name: "web_search",
+                    spec: std::any::type_name::<WebSearch>(),
+                },
+                Requirement::Context {
+                    type_name: std::any::type_name::<RelevantMemory>(),
+                },
+            ],
+        }
+    );
+    assert_eq!(
+        agent.meta().to_string(),
+        "researcher\n\
+         ├── requires Llm\n\
+         ├── can call Tool<web_search>\n\
+         └── requires Context<RelevantMemory>"
     );
 }
 
+// 3. Missing dependencies fail before the body executes, and all are reported.
 #[tokio::test]
-async fn reports_every_missing_requirement_and_never_calls_the_fn() {
+async fn missing_dependencies_fail_before_body() -> TestResult {
     static CALLED: AtomicBool = AtomicBool::new(false);
     async fn agent(_llm: Llm, _web: Tool<WebSearch>, _mem: Context<RelevantMemory>) {
         CALLED.store(true, Ordering::SeqCst);
     }
 
     let mut world = AgentWorld::new();
-    world.insert(MemoryStore::default()); // Task still missing.
+    world.provide_llm(FakeLlm::new())?;
 
     let err = world.run(agent).await.unwrap_err();
     assert!(!CALLED.load(Ordering::SeqCst));
-    assert!(err.agent.ends_with("agent"), "{}", err.agent);
+    let RunError::Unresolved(diagnostics) = &err else {
+        panic!("expected Unresolved, got {err:?}");
+    };
+    assert_eq!(diagnostics.missing().count(), 2);
     assert_eq!(
-        err.missing,
-        vec![
-            Requirement::Llm,
-            Requirement::Tool {
-                name: "web_search",
-                spec: std::any::type_name::<WebSearch>()
-            },
-            Requirement::Context {
-                type_name: std::any::type_name::<RelevantMemory>(),
-                needs: vec![Requirement::Resource {
-                    type_name: std::any::type_name::<Task>()
-                }],
-            },
-        ]
+        err.to_string(),
+        "Cannot prepare agent:\n  \
+         ✓ Llm\n  \
+         ✗ Tool<web_search>: no provider registered\n  \
+         ✗ Context<RelevantMemory>: no provider registered"
     );
-    let msg = err.to_string();
-    assert!(msg.contains("- Llm"), "{msg}");
-    assert!(msg.contains("- Tool<web_search>"), "{msg}");
-    assert!(msg.contains("(needs Res<worldfn::context::Task>)"), "{msg}");
-
-    assert_eq!(world.validate(agent), Err(err));
+    assert_eq!(world.prepare(agent).err(), Some(err));
+    Ok(())
 }
 
+// 4. Substituting fakes changes neither the signature nor the body, and
+// separate worlds stay isolated.
 #[tokio::test]
-async fn zero_arity_and_closures() {
-    async fn constant() -> u32 {
-        7
-    }
-    let world = AgentWorld::new();
-    assert_eq!(world.run(constant).await, Ok(7));
-
-    // A closure returning an `async move` block is also an agent.
-    let mut world = AgentWorld::new();
-    world.insert(Task::new("hi"));
-    let shout = |task: Res<Task>| async move { task.0.to_uppercase() };
-    assert_eq!(world.run(shout).await.unwrap(), "HI");
-}
-
-#[tokio::test]
-async fn optional_and_nested_tuple_params() {
-    async fn agent(maybe_llm: Option<Llm>, (task, _mem): (Res<Task>, Res<MemoryStore>)) -> String {
-        match maybe_llm {
-            Some(llm) => llm.complete(task.0.clone()).await.unwrap(),
-            None => format!("no llm for {}", task.0),
-        }
-    }
-
-    let mut world = AgentWorld::new();
-    world.insert(Task::new("t")).insert(MemoryStore::default());
-    assert_eq!(world.run(agent).await.unwrap(), "no llm for t");
-
-    world.insert_llm(FakeLlm::echo());
-    assert_eq!(world.run(agent).await.unwrap(), "t");
-
-    assert_eq!(
-        agent.into_agent().requirements()[0],
-        Requirement::Optional(Box::new(Requirement::Llm))
+async fn same_agent_different_isolated_worlds() -> TestResult {
+    let (llm_a, llm_b) = (FakeLlm::with_answer("A"), FakeLlm::echo());
+    let (web_a, web_b) = (
+        FakeTool::with_response(vec![hit("a")]),
+        FakeTool::with_response(vec![]),
     );
+    let world_a = research_world(llm_a.clone(), web_a.clone(), RelevantMemory::default())?;
+    let world_b = research_world(llm_b.clone(), web_b.clone(), RelevantMemory::new(["m"]))?;
+
+    assert_eq!(world_a.run(researcher).await?, Answer("A".into()));
+    let echoed = world_b.run(researcher).await?;
+    assert!(echoed.0.contains("[\"m\"]"), "{echoed:?}");
+
+    assert_eq!((llm_a.calls(), web_a.calls()), (1, 1));
+    assert_eq!((llm_b.calls(), web_b.calls()), (1, 1));
+    Ok(())
+}
+
+// 5. Typed outputs and domain errors are preserved, one layer below RunError;
+// provider errors are not reported as missing dependencies.
+#[derive(Debug, PartialEq)]
+enum AgentError {
+    Llm(LlmError),
+    Tool(ToolError),
+}
+
+impl std::fmt::Display for AgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for AgentError {}
+
+async fn fallible(llm: Llm, web: Tool<WebSearch>) -> Result<Answer, AgentError> {
+    web.call("q".into()).await.map_err(AgentError::Tool)?;
+    let text = llm.complete("p").await.map_err(AgentError::Llm)?;
+    Ok(Answer(text))
 }
 
 #[tokio::test]
-async fn user_defined_context_and_param() {
-    /// A custom context composed from another context and a resource.
-    struct Briefing(String);
-    impl ContextSource for Briefing {
-        type Deps = (Res<Task>, Context<RelevantMemory>);
-        fn build((task, mem): Self::Deps) -> Self {
-            Briefing(format!("{} | {}", task.0, mem.entries.join("; ")))
-        }
-    }
-
-    /// A custom param implemented by hand.
-    struct Budget(u32);
-    impl AgentParam for Budget {
-        fn describe(out: &mut Vec<Requirement>) {
-            out.push(Requirement::Resource {
-                type_name: "Budget",
-            });
-        }
-        fn fetch(world: &AgentWorld) -> Result<Self, Vec<Requirement>> {
-            let task = world.resource::<Task>().ok_or_else(|| {
-                let mut v = Vec::new();
-                Self::describe(&mut v);
-                v
-            })?;
-            Ok(Budget(task.0.len() as u32 * 10))
-        }
-    }
-
-    async fn agent(brief: Context<Briefing>, budget: Budget) -> (String, u32) {
-        (brief.0.0, budget.0)
-    }
+async fn domain_errors_are_not_runtime_errors() -> TestResult {
+    let mut world = AgentWorld::new();
+    world
+        .provide_llm(FakeLlm::with_answer("ok"))?
+        .provide_tool::<WebSearch>(FakeTool::with_response(vec![]))?;
+    let answer: Answer = world.run(fallible).await??;
+    assert_eq!(answer, Answer("ok".into()));
 
     let mut world = AgentWorld::new();
     world
-        .insert(Task::new("rust tips"))
-        .insert(MemoryStore::new(["rust has traits", "cats"]));
+        .provide_llm(FakeLlm::new().then_error("overloaded"))?
+        .provide_tool::<WebSearch>(FakeTool::with_response(vec![]))?;
     assert_eq!(
-        world.run(agent).await.unwrap(),
-        ("rust tips | rust has traits".to_string(), 90)
+        world.run(fallible).await?,
+        Err(AgentError::Llm(LlmError("overloaded".into())))
     );
+
+    let mut world = AgentWorld::new();
+    world
+        .provide_llm(FakeLlm::new())?
+        .provide_tool::<WebSearch>(FakeTool::failing("rate limited"))?;
+    assert_eq!(
+        world.run(fallible).await?,
+        Err(AgentError::Tool(ToolError("rate limited".into())))
+    );
+    Ok(())
 }
 
 #[tokio::test]
-async fn boxed_heterogeneous_agents_run_concurrently() {
+async fn fake_llm_rejects_unexpected_calls() -> TestResult {
+    async fn twice(llm: Llm) -> (Result<String, LlmError>, Result<String, LlmError>) {
+        (llm.complete("1").await, llm.complete("2").await)
+    }
+    let mut world = AgentWorld::new();
+    world.provide_llm(FakeLlm::with_answer("one"))?;
+    let (first, second) = world.run(twice).await?;
+    assert_eq!(first, Ok("one".into()));
+    assert_eq!(
+        second,
+        Err(LlmError("FakeLlm received an unexpected call #2".into()))
+    );
+    Ok(())
+}
+
+// 6. Zero, one, multiple, and the maximum supported (8) parameters.
+#[tokio::test]
+async fn arities_zero_one_three_and_max() -> TestResult {
+    async fn zero() -> u8 {
+        0
+    }
+    async fn one(_: Llm) -> u8 {
+        1
+    }
+    async fn three(_: Llm, _: Tool<WebSearch>, _: Context<RelevantMemory>) -> u8 {
+        3
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn eight(
+        _: Llm,
+        _: Tool<WebSearch>,
+        _: Context<RelevantMemory>,
+        _: Res<u32>,
+        _: Res<String>,
+        _: Option<Res<bool>>,
+        _: Llm,
+        (_, _): (Res<u32>, Res<String>),
+    ) -> u8 {
+        8
+    }
+
+    let mut world = research_world(
+        FakeLlm::new(),
+        FakeTool::failing("x"),
+        RelevantMemory::default(),
+    )?;
+    world.provide(7u32)?.provide(String::from("s"))?;
+
+    assert_eq!(world.run(zero).await?, 0);
+    assert_eq!(world.run(one).await?, 1);
+    assert_eq!(world.run(three).await?, 3);
+    assert_eq!(world.run(eight).await?, 8);
+    Ok(())
+}
+
+// 8. Prepared runs initialize state once and resolve per invocation.
+struct Counted {
+    inits: Arc<AtomicUsize>,
+    resolves: Arc<AtomicUsize>,
+}
+
+impl AgentParam for Counted {
+    type State = Arc<AtomicUsize>;
+
+    fn describe(out: &mut Vec<Requirement>) {
+        out.push(Requirement::Resource {
+            type_name: "Counters",
+        });
+    }
+
+    fn init(world: &AgentWorld) -> Result<Self::State, Vec<Requirement>> {
+        let inits = world
+            .resource::<Counters>()
+            .ok_or_else(|| {
+                vec![Requirement::Resource {
+                    type_name: "Counters",
+                }]
+            })?
+            .inits
+            .clone();
+        inits.fetch_add(1, Ordering::SeqCst);
+        Ok(inits)
+    }
+
+    fn resolve(state: &mut Self::State, world: &AgentWorld) -> Result<Self, ParamError> {
+        let resolves = world.resource::<Counters>().unwrap().resolves.clone();
+        resolves.fetch_add(1, Ordering::SeqCst);
+        Ok(Counted {
+            inits: state.clone(),
+            resolves,
+        })
+    }
+}
+
+#[derive(Default)]
+struct Counters {
+    inits: Arc<AtomicUsize>,
+    resolves: Arc<AtomicUsize>,
+}
+
+async fn counted(c: Counted) -> (usize, usize) {
+    (
+        c.inits.load(Ordering::SeqCst),
+        c.resolves.load(Ordering::SeqCst),
+    )
+}
+
+#[tokio::test]
+async fn prepared_agent_reuses_init_state() -> TestResult {
+    let mut world = AgentWorld::new();
+    world.provide(Counters::default())?;
+
+    let mut agent = world.prepare(counted)?;
+    assert_eq!(world.run_prepared(&mut agent).await?, (1, 1));
+    assert_eq!(world.run_prepared(&mut agent).await?, (1, 2));
+
+    // The one-shot path initializes every time.
+    assert_eq!(world.run(counted).await?, (2, 3));
+    Ok(())
+}
+
+#[tokio::test]
+async fn stateful_closures_are_agents() -> TestResult {
+    let mut world = AgentWorld::new();
+    world.provide_llm(FakeLlm::echo())?;
+    let mut n = 0;
+    let mut agent = world.prepare(move |llm: Llm| {
+        n += 1;
+        let prompt = format!("call {n}");
+        async move { llm.complete(prompt).await.unwrap() }
+    })?;
+    assert_eq!(world.run_prepared(&mut agent).await?, "call 1");
+    assert_eq!(world.run_prepared(&mut agent).await?, "call 2");
+    Ok(())
+}
+
+// 9. Stale or cross-world prepared state cannot silently use wrong bindings.
+#[tokio::test]
+async fn stale_and_foreign_prepared_state_is_rejected() -> TestResult {
+    async fn ask(llm: Llm) -> String {
+        llm.complete("q").await.unwrap()
+    }
+    let mut world = AgentWorld::new();
+    world.provide_llm(FakeLlm::with_answer("old"))?;
+    let mut agent = world.prepare(ask)?;
+
+    let other = research_world(
+        FakeLlm::echo(),
+        FakeTool::failing("x"),
+        RelevantMemory::default(),
+    )?;
+    assert!(matches!(
+        other.run_prepared(&mut agent).await,
+        Err(RunError::ForeignWorld { .. })
+    ));
+
+    world.replace(Llm::new(FakeLlm::with_answer("new")));
+    assert!(matches!(
+        world.run_prepared(&mut agent).await,
+        Err(RunError::Stale { .. })
+    ));
+
+    agent.initialize(&world)?;
+    assert_eq!(world.run_prepared(&mut agent).await?, "new");
+
+    let mut unprepared = ask.into_agent();
+    assert!(matches!(
+        world.run_prepared(&mut unprepared).await,
+        Err(RunError::NotPrepared { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn duplicate_bindings_are_rejected() {
+    let mut world = AgentWorld::new();
+    world.provide_llm(FakeLlm::new()).unwrap();
+    let err = world.provide_llm(FakeLlm::new()).unwrap_err();
+    assert_eq!(err.type_name, std::any::type_name::<Llm>());
+    assert!(err.to_string().contains("use `replace` to rebind"));
+}
+
+// Extras: optional capabilities, boxed agents, 'static run futures.
+#[tokio::test]
+async fn optional_params_degrade_explicitly() -> TestResult {
+    async fn agent(llm: Option<Llm>) -> &'static str {
+        if llm.is_some() { "llm" } else { "no llm" }
+    }
+    let mut world = AgentWorld::new();
+    assert_eq!(world.run(agent).await?, "no llm");
+    world.provide_llm(FakeLlm::new())?;
+    assert_eq!(world.run(agent).await?, "llm");
+    assert_eq!(
+        agent.into_agent().meta().to_string(),
+        "agent\n└── may use Option<Llm>"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn boxed_heterogeneous_agents() -> TestResult {
     async fn a(llm: Llm) -> String {
         llm.complete("a").await.unwrap()
     }
-    async fn b(task: Res<Task>) -> String {
-        task.0.clone()
+    async fn b(n: Res<u32>) -> String {
+        n.to_string()
     }
-
     let mut world = AgentWorld::new();
-    world.insert_llm(FakeLlm::echo()).insert(Task::new("b"));
+    world.provide_llm(FakeLlm::echo())?.provide(7u32)?;
 
-    let agents: Vec<Box<dyn Agent<Output = String>>> = vec![
-        Box::new(a.into_agent()),
-        Box::new(FunctionAgent::with_name(b.into_agent(), "task-reader")),
+    let mut agents: Vec<Box<dyn Agent<Output = String>>> = vec![
+        Box::new(world.prepare(a)?),
+        Box::new(world.prepare(FunctionAgent::with_name(b.into_agent(), "reader"))?),
     ];
-    assert_eq!(agents[1].name(), "task-reader");
+    assert_eq!(agents[1].meta().name, "reader");
 
-    let (x, y) = tokio::join!(world.run_agent(&*agents[0]), world.run_agent(&*agents[1]));
-    assert_eq!((x.unwrap(), y.unwrap()), ("a".to_string(), "b".to_string()));
+    let mut outputs = Vec::new();
+    for agent in &mut agents {
+        outputs.push(world.run_prepared(agent).await?);
+    }
+    assert_eq!(outputs, ["a", "7"]);
+    Ok(())
 }
 
 #[tokio::test]
-async fn run_future_is_static_and_spawnable() {
-    let world = research_world(FakeLlm::scripted(["ok"]), FakeTool::new(|_| Ok(vec![])));
-
-    // Parameters are resolved at `run` time; the future owns them.
+async fn run_future_is_static_and_spawnable() -> TestResult {
+    let world = research_world(
+        FakeLlm::with_answer("ok"),
+        FakeTool::with_response(vec![]),
+        RelevantMemory::default(),
+    )?;
     let handle = tokio::spawn(world.run(researcher));
     drop(world);
-    assert_eq!(handle.await.unwrap().unwrap(), Answer("ok".into()));
-}
-
-#[tokio::test]
-async fn fake_errors_surface_to_the_agent() {
-    async fn agent(
-        llm: Llm,
-        web: Tool<WebSearch>,
-    ) -> (Result<String, LlmError>, Result<usize, ToolError>) {
-        let search = web.call("x".into()).await.map(|hits| hits.len());
-        (llm.complete("p").await, search)
-    }
-
-    let mut world = AgentWorld::new();
-    world
-        .insert_llm(FakeLlm::scripted(Vec::<String>::new()))
-        .insert_tool::<WebSearch>(FakeTool::new(|_| Err(ToolError("rate limited".into()))));
-
-    let (llm, web) = world.run(agent).await.unwrap();
-    assert_eq!(llm, Err(LlmError("FakeLlm script exhausted".into())));
-    assert_eq!(web, Err(ToolError("rate limited".into())));
-}
-
-#[tokio::test]
-async fn world_resources_are_shared_handles() {
-    let mut world = AgentWorld::new();
-    world.insert(Task::new("one"));
-    let arc: Option<Arc<Task>> = world.resource_arc::<Task>();
-    assert_eq!(arc.as_deref(), Some(&Task::new("one")));
-    assert!(world.contains::<Task>());
-    assert!(!world.contains::<MemoryStore>());
+    assert_eq!(handle.await??, Answer("ok".into()));
+    Ok(())
 }

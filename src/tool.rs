@@ -1,9 +1,9 @@
 use std::any::type_name;
 use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::{AgentParam, AgentWorld, BoxFuture, Requirement};
+use crate::param::unmet;
+use crate::{AgentParam, AgentWorld, BoxFuture, ParamError, Requirement};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolError(pub String);
@@ -16,25 +16,22 @@ impl fmt::Display for ToolError {
 
 impl std::error::Error for ToolError {}
 
-/// The typed signature of a tool. Implemented by marker types like
-/// [`WebSearch`]; the implementation lives in a [`ToolHandler`].
-///
-/// Separating the spec from the handler is what lets `Tool<WebSearch>` in a
-/// function signature be a pure capability *declaration*, bound to a real or
-/// fake implementation by whoever builds the world.
+/// The typed contract of a logical tool, implemented by marker types such as
+/// [`WebSearch`]. Real and fake handlers both implement the same contract, so
+/// `Tool<WebSearch>` in a signature never changes when the handler does.
 pub trait ToolSpec: Send + Sync + 'static {
     const NAME: &'static str;
-    type Input: Send + 'static;
-    type Output: Send + 'static;
+    type Request: Send + 'static;
+    type Response: Send + 'static;
 }
 
-/// An implementation of tool `T`. Boxed future for object safety (see
-/// [`LlmProvider`](crate::LlmProvider)).
+/// An implementation of tool `T`. Boxed future because handlers are
+/// type-erased behind `Tool<T>` (see [`LlmProvider`](crate::LlmProvider)).
 pub trait ToolHandler<T: ToolSpec>: Send + Sync + 'static {
-    fn call(&self, input: T::Input) -> BoxFuture<'_, Result<T::Output, ToolError>>;
+    fn call(&self, request: T::Request) -> BoxFuture<'_, Result<T::Response, ToolError>>;
 }
 
-/// Parameter: access to the world's handler for tool `T`.
+/// Parameter: the world's handler for tool `T`.
 pub struct Tool<T: ToolSpec> {
     handler: Arc<dyn ToolHandler<T>>,
 }
@@ -46,8 +43,8 @@ impl<T: ToolSpec> Tool<T> {
         }
     }
 
-    pub async fn call(&self, input: T::Input) -> Result<T::Output, ToolError> {
-        self.handler.call(input).await
+    pub async fn call(&self, request: T::Request) -> Result<T::Response, ToolError> {
+        self.handler.call(request).await
     }
 }
 
@@ -60,6 +57,8 @@ impl<T: ToolSpec> Clone for Tool<T> {
 }
 
 impl<T: ToolSpec> AgentParam for Tool<T> {
+    type State = Tool<T>;
+
     fn describe(out: &mut Vec<Requirement>) {
         out.push(Requirement::Tool {
             name: T::NAME,
@@ -67,53 +66,84 @@ impl<T: ToolSpec> AgentParam for Tool<T> {
         });
     }
 
-    fn fetch(world: &AgentWorld) -> Result<Self, Vec<Requirement>> {
-        world.resource::<Tool<T>>().cloned().ok_or_else(|| {
-            let mut missing = Vec::new();
-            Self::describe(&mut missing);
-            missing
-        })
+    fn init(world: &AgentWorld) -> Result<Self::State, Vec<Requirement>> {
+        world
+            .resource::<Tool<T>>()
+            .cloned()
+            .ok_or_else(unmet::<Self>)
+    }
+
+    fn resolve(state: &mut Self::State, _world: &AgentWorld) -> Result<Self, ParamError> {
+        Ok(state.clone())
     }
 }
 
-type FakeFn<T> =
-    dyn Fn(<T as ToolSpec>::Input) -> Result<<T as ToolSpec>::Output, ToolError> + Send + Sync;
+type Respond<T> =
+    dyn Fn(&<T as ToolSpec>::Request) -> Result<<T as ToolSpec>::Response, ToolError> + Send + Sync;
 
-/// A synchronous, deterministic tool for tests. Clones share the call count.
+/// A deterministic handler for tool `T` that records every typed request.
+/// Clones share the record, so keep a clone after `provide_tool`.
 pub struct FakeTool<T: ToolSpec> {
-    f: Arc<FakeFn<T>>,
-    calls: Arc<AtomicUsize>,
+    respond: Arc<Respond<T>>,
+    requests: Arc<Mutex<Vec<T::Request>>>,
 }
 
 impl<T: ToolSpec> FakeTool<T> {
+    /// Compute each response from the request.
     pub fn new(
-        f: impl Fn(T::Input) -> Result<T::Output, ToolError> + Send + Sync + 'static,
+        respond: impl Fn(&T::Request) -> Result<T::Response, ToolError> + Send + Sync + 'static,
     ) -> Self {
         Self {
-            f: Arc::new(f),
-            calls: Arc::default(),
+            respond: Arc::new(respond),
+            requests: Arc::default(),
         }
     }
 
-    /// How many times the tool has been called.
+    /// Always return a clone of `response`.
+    pub fn with_response(response: T::Response) -> Self
+    where
+        T::Response: Clone + Sync,
+    {
+        Self::new(move |_| Ok(response.clone()))
+    }
+
+    /// Always fail with `message`.
+    pub fn failing(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self::new(move |_| Err(ToolError(message.clone())))
+    }
+
+    /// Every request received so far, in order.
+    pub fn requests(&self) -> Vec<T::Request>
+    where
+        T::Request: Clone,
+    {
+        self.lock().clone()
+    }
+
     pub fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
+        self.lock().len()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<T::Request>> {
+        self.requests.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 impl<T: ToolSpec> Clone for FakeTool<T> {
     fn clone(&self) -> Self {
         Self {
-            f: self.f.clone(),
-            calls: self.calls.clone(),
+            respond: self.respond.clone(),
+            requests: self.requests.clone(),
         }
     }
 }
 
 impl<T: ToolSpec> ToolHandler<T> for FakeTool<T> {
-    fn call(&self, input: T::Input) -> BoxFuture<'_, Result<T::Output, ToolError>> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(std::future::ready((self.f)(input)))
+    fn call(&self, request: T::Request) -> BoxFuture<'_, Result<T::Response, ToolError>> {
+        let response = (self.respond)(&request);
+        self.lock().push(request);
+        Box::pin(std::future::ready(response))
     }
 }
 
@@ -129,6 +159,6 @@ pub struct SearchHit {
 
 impl ToolSpec for WebSearch {
     const NAME: &'static str = "web_search";
-    type Input = String;
-    type Output = Vec<SearchHit>;
+    type Request = String;
+    type Response = Vec<SearchHit>;
 }

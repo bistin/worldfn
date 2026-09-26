@@ -1,108 +1,158 @@
-use std::any::{Any, TypeId};
-use std::borrow::Cow;
+use std::any::{Any, TypeId, type_name};
 use std::collections::HashMap;
-use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{Agent, IntoAgent, Llm, LlmProvider, Requirement, Tool, ToolHandler, ToolSpec};
+use crate::{
+    Agent, BindError, Context, IntoAgent, Llm, LlmProvider, RunError, Tool, ToolHandler, ToolSpec,
+};
+
+static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Identifies a world and the version of its bindings. Prepared agents record
+/// the stamp they were initialized against and refuse to run on any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorldStamp {
+    pub world: u64,
+    pub generation: u64,
+}
 
 /// The container agents resolve their parameters from. Analogue of Bevy's
-/// `World`, reduced to a type-keyed resource map.
+/// `World`, reduced to a type-keyed binding map with safe downcasts.
 ///
-/// LLMs and tools are stored as ordinary resources ([`Llm`] and [`Tool<T>`]
-/// are themselves cheap handles), so there is one storage and one lookup
-/// path.
-#[derive(Default)]
+/// Each key has exactly one binding. [`provide`](Self::provide) refuses to
+/// overwrite; [`replace`](Self::replace) rebinds explicitly and bumps the
+/// binding generation, which invalidates every agent prepared earlier.
+///
+/// `Llm`, `Tool<T>` and `Context<T>` are stored as ordinary bindings keyed by
+/// those logical types, so a fake is bound to the logical requirement
+/// explicitly (`provide_llm(FakeLlm)` stores an `Llm`), never matched by the
+/// fake's own `TypeId`.
 pub struct AgentWorld {
-    resources: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
+    id: u64,
+    generation: u64,
+    bindings: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
+}
+
+impl std::fmt::Debug for AgentWorld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentWorld")
+            .field("id", &self.id)
+            .field("generation", &self.generation)
+            .field("bindings", &self.bindings.len())
+            .finish()
+    }
+}
+
+impl Default for AgentWorld {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AgentWorld {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            id: NEXT_WORLD_ID.fetch_add(1, Ordering::Relaxed),
+            generation: 0,
+            bindings: HashMap::new(),
+        }
     }
 
-    /// Insert (or replace) a resource.
-    pub fn insert<T: Send + Sync + 'static>(&mut self, value: T) -> &mut Self {
-        self.resources.insert(TypeId::of::<T>(), Arc::new(value));
+    /// Bind a dependency, read by `Res<T>` parameters. Fails if `T` is
+    /// already bound.
+    pub fn provide<T: Send + Sync + 'static>(&mut self, value: T) -> Result<&mut Self, BindError> {
+        if self.contains::<T>() {
+            return Err(BindError {
+                type_name: type_name::<T>(),
+            });
+        }
+        Ok(self.replace(value))
+    }
+
+    /// Bind or rebind `T`. Invalidates every agent prepared against this world.
+    pub fn replace<T: Send + Sync + 'static>(&mut self, value: T) -> &mut Self {
+        self.bindings.insert(TypeId::of::<T>(), Arc::new(value));
+        self.generation += 1;
         self
     }
 
-    /// Register the LLM provider used by `Llm` parameters.
-    pub fn insert_llm(&mut self, provider: impl LlmProvider) -> &mut Self {
-        self.insert(Llm::new(provider))
+    /// Bind the provider behind `Llm` parameters.
+    pub fn provide_llm(&mut self, provider: impl LlmProvider) -> Result<&mut Self, BindError> {
+        self.provide(Llm::new(provider))
     }
 
-    /// Register the handler used by `Tool<T>` parameters.
-    pub fn insert_tool<T: ToolSpec>(&mut self, handler: impl ToolHandler<T>) -> &mut Self {
-        self.insert(Tool::<T>::new(handler))
+    /// Bind the handler behind `Tool<T>` parameters.
+    pub fn provide_tool<T: ToolSpec>(
+        &mut self,
+        handler: impl ToolHandler<T>,
+    ) -> Result<&mut Self, BindError> {
+        self.provide(Tool::<T>::new(handler))
+    }
+
+    /// Bind an already materialized snapshot behind `Context<T>` parameters.
+    pub fn provide_context<T: Send + Sync + 'static>(
+        &mut self,
+        snapshot: T,
+    ) -> Result<&mut Self, BindError> {
+        self.provide(Context::new(snapshot))
     }
 
     pub fn contains<T: Send + Sync + 'static>(&self) -> bool {
-        self.resources.contains_key(&TypeId::of::<T>())
+        self.bindings.contains_key(&TypeId::of::<T>())
     }
 
     pub fn resource<T: Send + Sync + 'static>(&self) -> Option<&T> {
-        self.resources.get(&TypeId::of::<T>())?.downcast_ref()
+        self.bindings.get(&TypeId::of::<T>())?.downcast_ref()
     }
 
     pub fn resource_arc<T: Send + Sync + 'static>(&self) -> Option<Arc<T>> {
-        self.resources
+        self.bindings
             .get(&TypeId::of::<T>())?
             .clone()
             .downcast()
             .ok()
     }
 
-    /// Resolve an agent's parameters and run it.
+    pub(crate) fn stamp(&self) -> WorldStamp {
+        WorldStamp {
+            world: self.id,
+            generation: self.generation,
+        }
+    }
+
+    /// Convert and initialize an agent for repeated runs against this world.
+    /// Parameter state is built once here and reused by every
+    /// [`run_prepared`](Self::run_prepared).
+    pub fn prepare<M, A: IntoAgent<M>>(&self, agent: A) -> Result<A::Agent, RunError> {
+        let mut agent = agent.into_agent();
+        agent.initialize(self)?;
+        Ok(agent)
+    }
+
+    /// One-shot: prepare, resolve and run. Pays for initialization every call;
+    /// use [`prepare`](Self::prepare) to reuse it.
     ///
-    /// Parameters are resolved **eagerly**, when `run` is called, not when
-    /// the future is first polled. The returned future is `Send + 'static`:
-    /// it does not borrow the world, so it can be spawned, and the world can
-    /// be mutated (or dropped) while it is in flight.
+    /// Everything that touches the world happens *now*; the returned future is
+    /// `Send + 'static`, borrows nothing, and can be spawned.
     pub fn run<M, A: IntoAgent<M>>(
         &self,
         agent: A,
-    ) -> impl Future<Output = Result<<A::Agent as Agent>::Output, ResolveError>>
-    + Send
-    + 'static
-    + use<M, A> {
-        self.run_agent(&agent.into_agent())
-    }
-
-    /// Like [`run`](Self::run), for an agent you keep and run repeatedly
-    /// (including `dyn Agent` trait objects).
-    pub fn run_agent<A: Agent + ?Sized>(
-        &self,
-        agent: &A,
-    ) -> impl Future<Output = Result<A::Output, ResolveError>> + Send + 'static + use<A> {
-        let started = agent.start(self);
+    ) -> impl Future<Output = Result<<A::Agent as Agent>::Output, RunError>> + Send + 'static + use<M, A>
+    {
+        let started = self.prepare(agent).and_then(|mut agent| agent.start(self));
         async move { Ok(started?.await) }
     }
 
-    /// Check whether this world can satisfy an agent, without running it.
-    pub fn validate<M, A: IntoAgent<M>>(&self, agent: A) -> Result<(), ResolveError> {
-        agent.into_agent().validate(self)
+    /// Run an agent prepared against this world, reusing its parameter state.
+    /// Fails with [`RunError::Stale`] or [`RunError::ForeignWorld`] rather than
+    /// silently using outdated bindings.
+    pub fn run_prepared<A: Agent + ?Sized>(
+        &self,
+        agent: &mut A,
+    ) -> impl Future<Output = Result<A::Output, RunError>> + Send + 'static + use<A> {
+        let started = agent.start(self);
+        async move { Ok(started?.await) }
     }
 }
-
-/// An agent's parameters could not be resolved.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolveError {
-    pub agent: Cow<'static, str>,
-    /// Every unmet requirement, not just the first.
-    pub missing: Vec<Requirement>,
-}
-
-impl fmt::Display for ResolveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "agent `{}` cannot run; missing:", self.agent)?;
-        for requirement in &self.missing {
-            write!(f, "\n  - {requirement}")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for ResolveError {}

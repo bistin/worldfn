@@ -1,75 +1,76 @@
 use std::any::type_name;
-use std::collections::HashSet;
+use std::fmt;
 use std::ops::Deref;
+use std::sync::Arc;
 
-use crate::{AgentParam, AgentWorld, Requirement, Res};
+use crate::param::unmet;
+use crate::{AgentParam, AgentWorld, ParamError, Requirement};
 
-/// A kind of context that is *derived* from other parameters rather than
-/// stored directly — e.g. "the memories relevant to the current task".
+/// Parameter: an **already materialized** context snapshot of type `T`,
+/// bound with [`AgentWorld::provide_context`].
 ///
-/// Its dependencies are themselves an [`AgentParam`] (usually a tuple), so
-/// contexts compose, and their requirements show up nested in
-/// [`Requirement::Context`].
-pub trait ContextSource: Sized + Send + 'static {
-    type Deps: AgentParam;
-    fn build(deps: Self::Deps) -> Self;
-}
+/// M1 does not retrieve, rank, or budget anything: whoever builds the world
+/// decides what the snapshot contains. Task-aware, per-invocation
+/// materialization is M2 work (see `DESIGN.md`).
+pub struct Context<T>(Arc<T>);
 
-/// Parameter: context of kind `C`, built fresh for each run.
-#[derive(Debug, Clone)]
-pub struct Context<C>(pub C);
+impl<T> Context<T> {
+    pub fn new(snapshot: T) -> Self {
+        Context(Arc::new(snapshot))
+    }
 
-impl<C> Context<C> {
-    pub fn into_inner(self) -> C {
+    pub fn into_inner(self) -> Arc<T> {
         self.0
     }
 }
 
-impl<C> Deref for Context<C> {
-    type Target = C;
-    fn deref(&self) -> &C {
+impl<T> Clone for Context<T> {
+    fn clone(&self) -> Self {
+        Context(self.0.clone())
+    }
+}
+
+impl<T> Deref for Context<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
         &self.0
     }
 }
 
-impl<C: ContextSource> AgentParam for Context<C> {
+impl<T: fmt::Debug> fmt::Debug for Context<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Context").field(&self.0).finish()
+    }
+}
+
+impl<T: Send + Sync + 'static> AgentParam for Context<T> {
+    type State = Context<T>;
+
     fn describe(out: &mut Vec<Requirement>) {
-        let mut needs = Vec::new();
-        C::Deps::describe(&mut needs);
         out.push(Requirement::Context {
-            type_name: type_name::<C>(),
-            needs,
+            type_name: type_name::<T>(),
         });
     }
 
-    fn fetch(world: &AgentWorld) -> Result<Self, Vec<Requirement>> {
-        match C::Deps::fetch(world) {
-            Ok(deps) => Ok(Context(C::build(deps))),
-            Err(needs) => Err(vec![Requirement::Context {
-                type_name: type_name::<C>(),
-                needs,
-            }]),
-        }
+    fn init(world: &AgentWorld) -> Result<Self::State, Vec<Requirement>> {
+        world
+            .resource::<Context<T>>()
+            .cloned()
+            .ok_or_else(unmet::<Self>)
+    }
+
+    fn resolve(state: &mut Self::State, _world: &AgentWorld) -> Result<Self, ParamError> {
+        Ok(state.clone())
     }
 }
 
-/// Resource: what the agent is currently being asked to do.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Task(pub String);
-
-impl Task {
-    pub fn new(task: impl Into<String>) -> Self {
-        Self(task.into())
-    }
-}
-
-/// Resource: a naive long-term memory.
-#[derive(Debug, Clone, Default)]
-pub struct MemoryStore {
+/// Example snapshot type: memory entries somebody already judged relevant.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RelevantMemory {
     pub entries: Vec<String>,
 }
 
-impl MemoryStore {
+impl RelevantMemory {
     pub fn new<I, S>(entries: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -78,46 +79,5 @@ impl MemoryStore {
         Self {
             entries: entries.into_iter().map(Into::into).collect(),
         }
-    }
-}
-
-/// Context: up to [`RelevantMemory::LIMIT`] memory entries that share a word
-/// with the current [`Task`], most overlapping first. A stand-in for
-/// embedding retrieval.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelevantMemory {
-    pub entries: Vec<String>,
-}
-
-impl RelevantMemory {
-    pub const LIMIT: usize = 3;
-}
-
-fn words(text: &str) -> HashSet<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() > 2)
-        .map(str::to_lowercase)
-        .collect()
-}
-
-impl ContextSource for RelevantMemory {
-    type Deps = (Res<MemoryStore>, Res<Task>);
-
-    fn build((store, task): Self::Deps) -> Self {
-        let query = words(&task.0);
-        let mut scored: Vec<(usize, &String)> = store
-            .entries
-            .iter()
-            .map(|entry| (words(entry).intersection(&query).count(), entry))
-            .filter(|(score, _)| *score > 0)
-            .collect();
-        // Stable sort keeps insertion order among equal scores.
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
-        let entries = scored
-            .into_iter()
-            .take(Self::LIMIT)
-            .map(|(_, e)| e.clone())
-            .collect();
-        RelevantMemory { entries }
     }
 }

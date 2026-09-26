@@ -1,0 +1,141 @@
+use std::borrow::Cow;
+use std::fmt;
+
+use crate::{AgentMeta, Requirement};
+
+/// A runtime-layer failure: the agent could not be prepared or started.
+///
+/// Kept separate from the function's own output. An agent returning
+/// `Result<Answer, AgentError>` runs as
+/// `Result<Result<Answer, AgentError>, RunError>`, so callers write `.await??`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunError {
+    /// Some declared requirements have no binding in the world.
+    Unresolved(Diagnostics),
+    /// `start` was called before `initialize`.
+    NotPrepared { agent: Cow<'static, str> },
+    /// The agent was prepared against a different world.
+    ForeignWorld { agent: Cow<'static, str> },
+    /// The world's bindings changed since the agent was prepared. Prepare again.
+    Stale { agent: Cow<'static, str> },
+    /// A parameter failed to resolve for this invocation.
+    Param {
+        agent: Cow<'static, str>,
+        error: ParamError,
+    },
+}
+
+impl fmt::Display for RunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RunError::Unresolved(diagnostics) => diagnostics.fmt(f),
+            RunError::NotPrepared { agent } => {
+                write!(f, "agent `{agent}` has not been prepared against a world")
+            }
+            RunError::ForeignWorld { agent } => {
+                write!(f, "agent `{agent}` was prepared against a different world")
+            }
+            RunError::Stale { agent } => write!(
+                f,
+                "agent `{agent}` is stale: world bindings changed since it was prepared"
+            ),
+            RunError::Param { agent, error } => write!(f, "agent `{agent}`: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RunError {}
+
+/// Which declared requirements are satisfied, for one agent and one world.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostics {
+    pub agent: Cow<'static, str>,
+    pub checks: Vec<Check>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Check {
+    pub requirement: Requirement,
+    pub satisfied: bool,
+}
+
+impl Diagnostics {
+    pub(crate) fn new(meta: &AgentMeta, missing: &[Requirement]) -> Self {
+        let checks = meta
+            .params
+            .iter()
+            .map(|requirement| Check {
+                requirement: requirement.clone(),
+                satisfied: !missing.contains(requirement),
+            })
+            .collect();
+        Self {
+            agent: meta.name.clone(),
+            checks,
+        }
+    }
+
+    pub fn missing(&self) -> impl Iterator<Item = &Requirement> {
+        self.checks
+            .iter()
+            .filter(|c| !c.satisfied)
+            .map(|c| &c.requirement)
+    }
+}
+
+/// ```text
+/// Cannot prepare researcher:
+///   ✓ Llm
+///   ✗ Tool<web_search>: no provider registered
+///   ✓ Context<RelevantMemory>
+/// ```
+impl fmt::Display for Diagnostics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Cannot prepare {}:", self.agent)?;
+        for check in &self.checks {
+            if check.satisfied {
+                write!(f, "\n  ✓ {}", check.requirement)?;
+            } else {
+                write!(f, "\n  ✗ {}: no provider registered", check.requirement)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A parameter could not produce its value for one invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParamError {
+    pub param: &'static str,
+    pub message: String,
+}
+
+impl fmt::Display for ParamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "parameter `{}` failed to resolve: {}",
+            self.param, self.message
+        )
+    }
+}
+
+impl std::error::Error for ParamError {}
+
+/// A binding already exists for this key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindError {
+    pub type_name: &'static str,
+}
+
+impl fmt::Display for BindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "`{}` is already bound in this world; use `replace` to rebind",
+            self.type_name
+        )
+    }
+}
+
+impl std::error::Error for BindError {}

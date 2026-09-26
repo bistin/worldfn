@@ -1,10 +1,11 @@
 //! # worldfn
 //!
-//! A minimal, Bevy-inspired typed function runtime for AI agents.
+//! **Function signature declares the world it needs.**
 //!
-//! An agent is an ordinary `async fn`. Its **parameter types are the
-//! declarative description of the capabilities and context it needs**; the
-//! [`AgentWorld`] resolves them by type before the function is called.
+//! A minimal, Bevy-inspired typed function runtime for AI agents. An agent is
+//! an ordinary `async fn`; its parameter types declare the dependencies,
+//! tools, and context it needs, and an [`AgentWorld`] prepares, validates, and
+//! runs it.
 //!
 //! ```
 //! use worldfn::prelude::*;
@@ -22,23 +23,31 @@
 //!     Answer(llm.complete(prompt).await.unwrap())
 //! }
 //!
-//! # tokio_test_block_on(async {
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # block_on(async {
 //! let mut world = AgentWorld::new();
 //! world
-//!     .insert_llm(FakeLlm::scripted(["42"]))
-//!     .insert_tool::<WebSearch>(FakeTool::new(|_q| Ok(vec![])))
-//!     .insert(MemoryStore::default())
-//!     .insert(Task::new("what is rust async?"));
+//!     .provide_llm(FakeLlm::with_answer("42"))?
+//!     .provide_tool::<WebSearch>(FakeTool::with_response(vec![]))?
+//!     .provide_context(RelevantMemory::new(["likes tokio"]))?;
 //!
-//! let answer = world.run(researcher).await.unwrap();
+//! let answer = world.run(researcher).await?;
 //! assert_eq!(answer, Answer("42".into()));
-//! # });
-//! # fn tokio_test_block_on<F: std::future::Future>(f: F) -> F::Output {
+//! # Ok(())
+//! # })
+//! # }
+//! # fn block_on<F: std::future::Future>(f: F) -> F::Output {
 //! #     tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
 //! # }
 //! ```
 //!
-//! The Bevy mapping:
+//! A parameter type that is not an [`AgentParam`] is rejected at compile time:
+//!
+//! ```compile_fail
+//! # use worldfn::prelude::*;
+//! async fn bad(prompt: String) {}
+//! let _ = AgentWorld::new().run(bad);
+//! ```
 //!
 //! | Bevy                  | worldfn            |
 //! |-----------------------|--------------------|
@@ -48,40 +57,45 @@
 //! | `System`              | [`Agent`]          |
 //! | `IntoSystem`          | [`IntoAgent`]      |
 //! | `FunctionSystem`      | [`FunctionAgent`]  |
+//! | `SystemState`         | [`AgentWorld::prepare`] |
 //!
-//! See `README.md` for the design compromises forced by Rust's async,
-//! lifetime, and arity rules.
+//! See `DESIGN.md` for the compromises forced by Rust's async, lifetime, and
+//! arity rules.
 
 mod agent;
 mod context;
+mod error;
 mod function;
 mod llm;
 mod param;
 mod tool;
 mod world;
 
-pub use agent::{Agent, AgentFuture, FunctionAgent, IntoAgent, IsAgent, IsFunctionAgent};
-pub use context::{Context, ContextSource, MemoryStore, RelevantMemory, Task};
+pub use agent::{
+    Agent, AgentFuture, AgentMeta, FunctionAgent, IntoAgent, IsAgent, IsFunctionAgent,
+};
+pub use context::{Context, RelevantMemory};
+pub use error::{BindError, Check, Diagnostics, ParamError, RunError};
 pub use function::AgentFunction;
 pub use llm::{FakeLlm, Llm, LlmError, LlmProvider};
 pub use param::{AgentParam, Requirement, Res};
 pub use tool::{FakeTool, SearchHit, Tool, ToolError, ToolHandler, ToolSpec, WebSearch};
-pub use world::{AgentWorld, ResolveError};
+pub use world::AgentWorld;
 
-/// A boxed, `Send` future. Used wherever a trait must stay object-safe.
+/// A boxed, `Send` future, used at type-erased provider boundaries.
 pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 pub mod prelude {
     pub use crate::{
-        Agent, AgentParam, AgentWorld, Context, ContextSource, FakeLlm, FakeTool, IntoAgent, Llm,
-        MemoryStore, RelevantMemory, Requirement, Res, Task, Tool, ToolSpec, WebSearch,
+        Agent, AgentParam, AgentWorld, Context, FakeLlm, FakeTool, IntoAgent, Llm, RelevantMemory,
+        Requirement, Res, RunError, Tool, ToolSpec, WebSearch,
     };
 }
 
-/// Implements a macro for every tuple arity from `$max` down to zero.
+/// Implements a macro for every tuple arity from the given list down to zero.
 ///
-/// Rust has no variadic generics, so — exactly like Bevy's `all_tuples!` —
-/// arity support is generated. `all_tuples!(m; A, B)` expands to
+/// Rust has no variadic generics, so — like Bevy's `all_tuples!` — arity
+/// support is generated. `all_tuples!(m; A, B)` expands to
 /// `m!(A, B); m!(B); m!();`.
 macro_rules! all_tuples {
     ($m:ident;) => { $m!(); };

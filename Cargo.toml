@@ -1,0 +1,12 @@
+[package]
+name = "worldfn"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A minimal Bevy-inspired typed function runtime for AI agents"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

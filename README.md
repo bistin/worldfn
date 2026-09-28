@@ -99,6 +99,24 @@ Bevy mapping:
 | `FunctionSystem` | `FunctionAgent` |
 | `SystemState` | `prepare` |
 
+## Real models
+
+Agents only see `Llm`, so choosing a model is a world-building decision.
+Providers are opt-in cargo features:
+
+| Feature | Provider |
+|---|---|
+| `openai-compat` | `OpenAiCompatLlm`: API-key access to DeepSeek, OpenAI, or any compatible server |
+| `codex` | `CodexLlm`: your ChatGPT subscription through the official Codex CLI's saved login. **Unofficial; personal experiments only.** |
+
+```sh
+WORLDFN_PROVIDER=deepseek WORLDFN_MODEL=deepseek-v4-flash DEEPSEEK_API_KEY=sk-... \
+  cargo run --example live --features openai-compat -- "your question"
+```
+
+Setup, caveats, and the Codex terms risk are in
+[`docs/providers.md`](docs/providers.md).
+
 ## Limitations
 
 - **Parameters are owned handles, not borrows from the world.** A borrowed
@@ -119,7 +137,8 @@ Bevy mapping:
   sequentially. No benchmarks have been run yet.
 - **There is one `Llm` per world.** Several models would need marker-typed
   handles such as `Llm<Fast>`.
-- **No real LLM provider, capability enforcement, graphs, or scheduler.**
+- **Providers are minimal.** One prompt in, text out. There are no tool calls, chat histories, retries, or streaming to the agent.
+- **No capability enforcement, graphs, or scheduler.**
 
 Details: [`DESIGN.md`](DESIGN.md). Background and roadmap:
 [`docs/design-discussion.md`](docs/design-discussion.md).
@@ -132,5 +151,10 @@ cargo clippy --all-targets
 cargo run --example researcher
 ```
 
-MSRV is 1.85 (edition 2024). The library has no dependencies; `tokio` is a
-dev-dependency.
+MSRV is 1.85 (edition 2024) for the core, which has no dependencies. The
+`codex` / `openai-compat` features add `reqwest` and `serde_json` and are
+tested on stable 1.94. `tokio` is a dev-dependency.
+
+```sh
+cargo test --all-features   # includes provider tests against a local mock server
+```

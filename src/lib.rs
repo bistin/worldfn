@@ -73,6 +73,8 @@ mod input;
 mod llm;
 mod memory;
 mod param;
+#[cfg(feature = "http")]
+pub mod providers;
 mod tool;
 mod world;
 

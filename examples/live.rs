@@ -16,6 +16,8 @@
 
 use worldfn::prelude::*;
 
+mod common;
+
 /// A small assistant: the task comes from the command line, and memory
 /// relevant to it is retrieved before the body runs.
 async fn assistant(
@@ -36,35 +38,6 @@ async fn assistant(
     llm.complete(prompt).await
 }
 
-fn llm_from_env() -> Result<Llm, Box<dyn std::error::Error>> {
-    let provider = std::env::var("WORLDFN_PROVIDER").unwrap_or_else(|_| "codex".into());
-    let model = std::env::var("WORLDFN_MODEL")
-        .map_err(|_| "set WORLDFN_MODEL to a model your provider currently offers")?;
-    let instructions = "Answer in at most five sentences.";
-    let llm = match provider.as_str() {
-        #[cfg(feature = "codex")]
-        "codex" => Llm::new(
-            worldfn::providers::CodexLlm::from_codex_home(model)?.instructions(instructions),
-        ),
-        #[cfg(feature = "openai-compat")]
-        "deepseek" => {
-            Llm::new(worldfn::providers::OpenAiCompatLlm::deepseek(model)?.system(instructions))
-        }
-        #[cfg(feature = "openai-compat")]
-        "openai" => {
-            Llm::new(worldfn::providers::OpenAiCompatLlm::openai(model)?.system(instructions))
-        }
-        other => {
-            return Err(format!(
-                "unknown or disabled provider `{other}`; enable its cargo feature \
-                 (codex / openai-compat)"
-            )
-            .into());
-        }
-    };
-    Ok(llm)
-}
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(error) = run().await {
@@ -83,7 +56,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut world = AgentWorld::new();
     world
-        .provide(llm_from_env()?)?
+        .provide(
+            common::llm_from_env("Answer in at most five sentences.")?
+                .ok_or("set WORLDFN_PROVIDER (codex / deepseek / openai)")?,
+        )?
         .provide_memory(FakeMemory::new([
             "the user is building worldfn, a typed agent runtime in Rust",
             "the user likes Bevy's system params",

@@ -31,3 +31,7 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "
 [[example]]
 name = "live"
 required-features = ["http"]
+
+[[example]]
+name = "triage"
+test = true

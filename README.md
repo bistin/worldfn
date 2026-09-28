@@ -99,6 +99,17 @@ Bevy mapping:
 | `FunctionSystem` | `FunctionAgent` |
 | `SystemState` | `prepare` |
 
+## Examples
+
+| Example | Shows | Needs |
+|---|---|---|
+| `researcher` | Requirement tree, ✓/✗ diagnostics, per-task context | nothing |
+| `triage` | Support-ticket triage: typed `enum` output, retrieval of similar past tickets, malformed model output as a domain error, concurrent runs of one prepared agent. `cargo test --example triage` tests the same agent with fakes. | nothing (fake LLM); optionally a real provider |
+| `live` | A small assistant against a real model | a provider feature and credentials |
+
+Examples that accept a real model read `WORLDFN_PROVIDER` / `WORLDFN_MODEL`
+(see below) and otherwise fall back to a fake.
+
 ## Real models
 
 Agents only see `Llm`, so choosing a model is a world-building decision.

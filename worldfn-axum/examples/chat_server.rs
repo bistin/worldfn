@@ -24,13 +24,20 @@ use axum::extract::{Query, State};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use worldfn::prelude::*;
-use worldfn::{LlmError, SseEvent, SseFrame, emit};
+use worldfn::{AsQuery, LlmError, SseEvent, SseFrame, emit};
 
 #[path = "../../examples/common/mod.rs"]
 mod common;
 
 #[derive(Debug, Clone)]
 struct Question(String);
+
+/// Lets skills be selected by the question text.
+impl AsQuery for Question {
+    fn query(&self) -> &str {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone)]
 enum ChatEvent {
@@ -69,15 +76,23 @@ async fn support_chat(
     question: Input<Question>,
     llm: Llm,
     kb: Context<Kb>,
+    skills: Context<RelevantSkills<2, Question>>,
     events: Emit<ChatEvent>,
 ) -> Result<String, LlmError> {
     events.send(ChatEvent::Status(format!(
         "found {} relevant passage(s)",
         kb.passages.len()
     )));
+    if !skills.skills.is_empty() {
+        events.send(ChatEvent::Status(format!(
+            "using skills: {}",
+            skills.names().join(", ")
+        )));
+    }
     events.send(ChatEvent::Status("asking the model…".into()));
     let prompt = format!(
-        "Answer using only these passages; say so if they are not enough.\n{}\n\nQuestion: {}",
+        "{}\n\nAnswer using only these passages; say so if they are not enough.\n{}\n\nQuestion: {}",
+        skills.prompt(),
         kb.passages
             .iter()
             .map(|p| format!("- {p}"))
@@ -148,7 +163,13 @@ fn app() -> Result<Router, Box<dyn std::error::Error>> {
     });
 
     let mut world = AgentWorld::new();
-    world.provide(llm)?.provide_memory(knowledge_base())?;
+    world
+        .provide(llm)?
+        .provide_memory(knowledge_base())?
+        .provide_skills(SkillLibrary::from_dir(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/skills"
+        ))?)?;
 
     // Fail at startup, not on the first request, if a dependency is missing.
     world.prepare(support_chat)?;

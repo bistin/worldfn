@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     Agent, AgentFuture, BindError, IntoAgent, Llm, LlmProvider, Memory, MemoryStore, RunError,
-    Scope, Tool, ToolHandler, ToolSpec,
+    Scope, SkillLibrary, Skills, Tool, ToolHandler, ToolSpec,
 };
 
 static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(0);
@@ -95,6 +95,11 @@ impl AgentWorld {
     /// Bind the store behind `Memory` (and so `Context<RelevantMemory<N>>`).
     pub fn provide_memory(&mut self, store: impl MemoryStore) -> Result<&mut Self, BindError> {
         self.provide(Memory::new(store))
+    }
+
+    /// Bind the skill library behind `Skills` (and the skill contexts).
+    pub fn provide_skills(&mut self, library: SkillLibrary) -> Result<&mut Self, BindError> {
+        self.provide(Skills::new(library))
     }
 
     pub fn contains<T: Send + Sync + 'static>(&self) -> bool {

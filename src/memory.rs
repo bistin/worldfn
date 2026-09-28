@@ -105,7 +105,7 @@ impl FakeMemory {
     }
 }
 
-fn words(text: &str) -> HashSet<String> {
+pub(crate) fn words(text: &str) -> HashSet<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.len() > 2)
         .map(str::to_lowercase)

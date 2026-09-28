@@ -99,6 +99,33 @@ Bevy mapping:
 | `FunctionSystem` | `FunctionAgent` |
 | `SystemState` | `prepare` |
 
+## Skills
+
+worldfn reads standard [Agent Skills](https://agentskills.io/specification)
+(`<name>/SKILL.md` with `name` / `description` frontmatter), so existing skill
+folders work as they are. As with everything else, the signature says how an
+agent uses them:
+
+```rust
+async fn support(
+    question: Input<Question>,
+    skills: Context<RelevantSkills<2, Question>>,  // up to 2 skills picked for this question
+    catalog: Context<SkillCatalog>,               // or: names + descriptions of all skills
+    llm: Llm,
+) -> Result<String, LlmError> {
+    llm.complete(format!("{}\n\n{}", skills.prompt(), question.0)).await
+}
+
+world.provide_skills(SkillLibrary::from_dir("skills")?)?;
+```
+
+Selection is currently done by the runtime, before the body runs, using word
+overlap that ignores words common to most skills. That is a deterministic
+stand-in for semantic matching. Once models can call tools, loading a skill can
+also become a tool the model calls. Bundled files are listed for the model but
+never read or executed. Skill text becomes model instructions, so only load
+skills you trust.
+
 ## Web frameworks
 
 The core knows no web framework. It meets them at three framework-neutral

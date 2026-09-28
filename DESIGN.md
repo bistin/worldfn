@@ -109,6 +109,26 @@ Consequences:
   parameter that fails to resolve, such as a failing retrieval, is still an
   error (§9: only explicitly optional context may degrade).
 
+## Skills
+
+Agent Skills are progressive disclosure: a catalog (level 1), full
+instructions when relevant (level 2), and bundled files (level 3). In worldfn
+each level is a parameter type, so the signature records how much of the
+library an agent can see:
+
+- `Context<SkillCatalog>` is level 1.
+- `Context<RelevantSkills<N, Q>>` is level 2, chosen by the runtime from the
+  per-invocation input `Q: AsQuery`.
+- Level 3 files are only listed, never read or run.
+
+`SkillLibrary` validates on load: names follow the spec and match their
+folders, names are unique, and descriptions are 1–1024 characters without
+angle brackets. Invalid skills fail loudly instead of being skipped. The
+frontmatter reader is a deliberately small subset of YAML (scalars, quoted
+strings, block scalars), which keeps the core free of dependencies; nested
+fields such as `metadata:` are ignored, as the spec allows. Model-driven
+loading (a `load_skill` tool) comes with tool calling.
+
 ## Framework seams
 
 worldfn must stay usable from any web framework (and from none), so the core

@@ -126,6 +126,32 @@ also become a tool the model calls. Bundled files are listed for the model but
 never read or executed. Skill text becomes model instructions, so only load
 skills you trust.
 
+## Sessions and account memory
+
+Conversation history is per session; long-term memory is per account. The
+caller authenticates and puts a `Principal { account, session }` in the scope,
+and memory parameters bind to it, so **an agent can only reach the caller's own
+memory**; no parameter lets it name another account.
+
+```rust
+async fn assistant(
+    question: Input<Question>,
+    history: Context<Conversation<10>>,     // read: last 10 turns of this session
+    recall: Context<Recall<3, Question>>,   // read: 3 memories of this account relevant to the question
+    log: SessionLog,                        // write: append to this session
+    memory: AccountMemory,                  // write: remember for this account
+    llm: Llm,
+) -> ...
+```
+
+An agent that declares only the `Context` types is read-only. Storage sits
+behind two traits (`store::SessionStore`, `store::AccountMemoryStore`) and
+takes an account id on every call. `store::Cached<S, C>` puts any `store::Cache`
+in front of a store, e.g. Postgres as the source of truth with Redis as a
+cache. Writes go to the store first; reads survive a cache outage; and
+`forget_account` purges the cache or fails. `store::conformance` is the test
+suite every backend and cache combination must pass; the in-memory ones do.
+
 ## Web frameworks
 
 The core knows no web framework. It meets them at three framework-neutral
@@ -160,7 +186,7 @@ it takes traffic.
 | `researcher` | Requirement tree, ✓/✗ diagnostics, per-task context | nothing |
 | `triage` | Support-ticket triage: typed `enum` output, retrieval of similar past tickets, malformed model output as a domain error, concurrent runs of one prepared agent. `cargo test --example triage` tests the same agent with fakes. | nothing (fake LLM); optionally a real provider |
 | `live` | A small assistant against a real model | a provider feature and credentials |
-| `worldfn-axum` `chat_server` | Chat page: question in, progress + answer streamed over SSE | nothing (fake LLM); optionally a real provider |
+| `worldfn-axum` `chat_server` | Chat page: question in, progress + answer streamed over SSE; skills; per-session history and per-account memory ("remember …") | nothing (fake LLM); optionally a real provider |
 
 Examples that accept a real model read `WORLDFN_PROVIDER` / `WORLDFN_MODEL`
 (see below) and otherwise fall back to a fake.

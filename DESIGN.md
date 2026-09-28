@@ -109,6 +109,42 @@ Consequences:
   parameter that fails to resolve, such as a failing retrieval, is still an
   error (§9: only explicitly optional context may degrade).
 
+## Session and account memory
+
+Memory has two scopes with different access patterns, so it has two traits
+rather than one generic store:
+
+- `SessionStore` holds conversation turns and is read by recency.
+- `AccountMemoryStore` holds long-term entries and is read by relevance.
+
+Every method takes the owning account, and session keys are
+`(account, session)`, so a guessed session id from another account reads
+nothing.
+
+Agents never see the traits. `SessionLog` and `AccountMemory` are handles
+bound during `resolve` to the `Principal` in the invocation scope. There is
+deliberately no public parameter wrapping the raw store, because that would
+let an agent pass any account id. `Context<Conversation<N>>` and
+`Context<Recall<N, Q>>` are read-only snapshots built from those handles, so
+the read/write capability shows in the signature. A missing `Principal` is a
+caller error (400).
+
+Caching is a decorator, not a backend. `Cached<S, C>` implements both traits
+over any store `S` and any `C: Cache` (get / set / delete / delete-prefix with
+TTL). A Redis crate therefore only implements `Cache`, and the cache policy is
+written and tested once:
+
+- Session reads fill a per-session window.
+- Writes go to the store, then invalidate the cached window.
+- Cache failures degrade to store reads.
+- Account searches bypass the cache.
+- `forget_account` must also purge every cached key of the account, or it
+  returns an error. A deletion is never reported done while copies may remain.
+
+Cache keys length-prefix ids so they cannot collide across accounts.
+`store::conformance` holds the shared behavioral tests; backend crates run it
+against their own stores.
+
 ## Skills
 
 Agent Skills are progressive disclosure: a catalog (level 1), full

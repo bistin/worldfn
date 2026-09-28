@@ -76,7 +76,9 @@ mod memory;
 mod param;
 #[cfg(feature = "http")]
 pub mod providers;
+pub mod scoped;
 pub mod skills;
+pub mod store;
 mod tool;
 mod world;
 
@@ -91,6 +93,7 @@ pub use input::{Input, Scope, Task};
 pub use llm::{FakeLlm, Llm, LlmError, LlmProvider};
 pub use memory::{FakeMemory, Memory, MemoryStore};
 pub use param::{AgentParam, Requirement, Res};
+pub use scoped::{AccountMemory, Conversation, Principal, Recall, SessionLog};
 pub use skills::{AsQuery, RelevantSkills, Skill, SkillCatalog, SkillLibrary, Skills};
 pub use tool::{FakeTool, SearchHit, Tool, ToolError, ToolHandler, ToolSpec, WebSearch};
 pub use world::AgentWorld;
@@ -99,6 +102,7 @@ pub use world::AgentWorld;
 pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 pub mod prelude {
+    pub use crate::{AccountMemory, Conversation, Principal, Recall, SessionLog};
     pub use crate::{
         Agent, AgentParam, AgentWorld, Context, ContextError, ContextSource, Emit, FakeLlm,
         FakeMemory, FakeTool, Input, IntoAgent, Llm, Memory, RelevantMemory, RelevantSkills,

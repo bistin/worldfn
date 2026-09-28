@@ -102,6 +102,22 @@ impl AgentWorld {
         self.provide(Skills::new(library))
     }
 
+    /// Bind conversation storage behind `SessionLog` / `Conversation<N>`.
+    pub fn provide_sessions(
+        &mut self,
+        store: impl crate::store::SessionStore,
+    ) -> Result<&mut Self, BindError> {
+        self.provide(crate::scoped::Sessions(Arc::new(store)))
+    }
+
+    /// Bind long-term storage behind `AccountMemory` / `Recall<N, Q>`.
+    pub fn provide_account_memory(
+        &mut self,
+        store: impl crate::store::AccountMemoryStore,
+    ) -> Result<&mut Self, BindError> {
+        self.provide(crate::scoped::AccountMemories(Arc::new(store)))
+    }
+
     pub fn contains<T: Send + Sync + 'static>(&self) -> bool {
         self.bindings.contains_key(&TypeId::of::<T>())
     }

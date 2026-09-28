@@ -234,6 +234,8 @@ Setup, caveats, and the Codex terms risk are in
 
 Details: [`DESIGN.md`](DESIGN.md). Background and roadmap:
 [`docs/design-discussion.md`](docs/design-discussion.md).
+Reference app API (investment mentor, first domain):
+[`docs/api-spec.md`](docs/api-spec.md).
 
 ## Development
 

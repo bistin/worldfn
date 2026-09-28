@@ -49,6 +49,7 @@ fn write_tree(f: &mut fmt::Formatter<'_>, reqs: &[Requirement], prefix: &str) ->
         let (verb, needs) = match requirement {
             Requirement::Tool { .. } => ("can call", None),
             Requirement::Input { .. } => ("reads", None),
+            Requirement::Emit { .. } => ("emits", None),
             Requirement::Optional(inner) => match &**inner {
                 Requirement::Context { needs, .. } => ("may use", Some(needs)),
                 _ => ("may use", None),

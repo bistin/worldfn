@@ -47,6 +47,30 @@ impl fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
+impl RunError {
+    /// Whether the caller of this invocation is at fault (it left an input or
+    /// event sink out of the scope), as opposed to the server's setup or an
+    /// upstream dependency. Framework adapters map this to 4xx vs 5xx.
+    pub fn is_caller_error(&self) -> bool {
+        matches!(
+            self,
+            RunError::Param { error, .. } if error.kind == ParamErrorKind::MissingFromScope
+        )
+    }
+
+    /// A suggested HTTP status, for framework adapters:
+    /// 400 for caller errors, 502 when a parameter's backend failed
+    /// (e.g. retrieval), 500 for setup errors (missing bindings, stale or
+    /// unprepared agents).
+    pub fn http_status(&self) -> u16 {
+        match self {
+            _ if self.is_caller_error() => 400,
+            RunError::Param { .. } => 502,
+            _ => 500,
+        }
+    }
+}
+
 /// Which declared requirements are satisfied, for one agent and one world.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostics {
@@ -105,7 +129,7 @@ impl fmt::Display for Diagnostics {
         write!(f, "Cannot prepare {}:", self.agent)?;
         for check in &self.checks {
             match &check.unmet {
-                None if matches!(check.requirement, Requirement::Input { .. }) => {
+                None if check.requirement.is_per_invocation() => {
                     write!(f, "\n  · {}: checked when started", check.requirement)?
                 }
                 None => write!(f, "\n  ✓ {}", check.requirement)?,
@@ -124,7 +148,36 @@ impl fmt::Display for Diagnostics {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamError {
     pub param: &'static str,
+    pub kind: ParamErrorKind,
     pub message: String,
+}
+
+/// Why a parameter failed to resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamErrorKind {
+    /// The caller did not supply a per-invocation value (an `Input` or an
+    /// `Emit` sink) in the `Scope`.
+    MissingFromScope,
+    /// Resolution itself failed, e.g. a retrieval backend errored.
+    Failed,
+}
+
+impl ParamError {
+    pub fn missing_from_scope(param: &'static str) -> Self {
+        Self {
+            param,
+            kind: ParamErrorKind::MissingFromScope,
+            message: "not present in the invocation scope".into(),
+        }
+    }
+
+    pub fn failed(param: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            param,
+            kind: ParamErrorKind::Failed,
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for ParamError {

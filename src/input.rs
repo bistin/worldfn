@@ -89,10 +89,12 @@ impl<T: Send + Sync + 'static> AgentParam for Input<T> {
     }
 
     fn resolve(_state: &mut (), _world: &AgentWorld, scope: &Scope) -> Self::Future {
-        ready(scope.get::<T>().map(Input).ok_or_else(|| ParamError {
-            param: type_name::<Self>(),
-            message: "not present in the invocation scope".into(),
-        }))
+        ready(
+            scope
+                .get::<T>()
+                .map(Input)
+                .ok_or_else(|| ParamError::missing_from_scope(type_name::<Self>())),
+        )
     }
 }
 

@@ -67,6 +67,7 @@
 
 mod agent;
 mod context;
+pub mod emit;
 mod error;
 mod function;
 mod input;
@@ -82,7 +83,8 @@ pub use agent::{
     Agent, AgentFuture, AgentMeta, FunctionAgent, IntoAgent, IsAgent, IsFunctionAgent,
 };
 pub use context::{Context, ContextError, ContextSource, RelevantMemory};
-pub use error::{BindError, Check, Diagnostics, ParamError, RunError};
+pub use emit::{Emit, EventStream, SseEvent, SseFrame};
+pub use error::{BindError, Check, Diagnostics, ParamError, ParamErrorKind, RunError};
 pub use function::AgentFunction;
 pub use input::{Input, Scope, Task};
 pub use llm::{FakeLlm, Llm, LlmError, LlmProvider};
@@ -96,9 +98,9 @@ pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T
 
 pub mod prelude {
     pub use crate::{
-        Agent, AgentParam, AgentWorld, Context, ContextError, ContextSource, FakeLlm, FakeMemory,
-        FakeTool, Input, IntoAgent, Llm, Memory, RelevantMemory, Requirement, Res, RunError, Scope,
-        Task, Tool, ToolSpec, WebSearch,
+        Agent, AgentParam, AgentWorld, Context, ContextError, ContextSource, Emit, FakeLlm,
+        FakeMemory, FakeTool, Input, IntoAgent, Llm, Memory, RelevantMemory, Requirement, Res,
+        RunError, Scope, Task, Tool, ToolSpec, WebSearch,
     };
 }
 

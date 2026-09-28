@@ -6,6 +6,9 @@ rust-version = "1.85"
 description = "A minimal Bevy-inspired typed function runtime for AI agents"
 license = "MIT OR Apache-2.0"
 
+[workspace]
+members = [".", "worldfn-axum"]
+
 [features]
 default = []
 # `CodexLlm`: calls the ChatGPT Codex backend with credentials written by the

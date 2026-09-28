@@ -99,6 +99,33 @@ Bevy mapping:
 | `FunctionSystem` | `FunctionAgent` |
 | `SystemState` | `prepare` |
 
+## Web frameworks
+
+The core knows no web framework. It meets them at three framework-neutral
+points, and each framework gets a thin adapter crate:
+
+| Core (`worldfn`) | Adapter (`worldfn-axum`) |
+|---|---|
+| `Scope`: per-invocation inputs | your handler builds it from extractors |
+| `Emit<E>` parameter + `EventStream<E>` + `SseEvent` | `worldfn_axum::sse(events)` → `axum::response::Sse` |
+| `RunError::http_status()`: 400 caller / 502 upstream / 500 setup | `AgentError` implements `IntoResponse` |
+
+```rust
+async fn support_chat(question: Input<Question>, llm: Llm, kb: Context<Kb>, events: Emit<ChatEvent>)
+    -> Result<String, LlmError> { /* no web types in here */ }
+
+async fn chat(State(world): State<Arc<AgentWorld>>, Query(q): Query<ChatQuery>) -> Response {
+    let (emitter, events) = emit::channel::<ChatEvent>();
+    tokio::spawn(world.run_with(support_chat, Scope::of(Question(q.q)).with(emitter)));
+    worldfn_axum::sse(events).into_response()
+}
+```
+
+`cargo run -p worldfn-axum --example chat_server` serves a small chat page on
+`http://127.0.0.1:3000` that streams progress and the answer over SSE. The
+server `prepare`s its agent at startup, so a missing dependency stops it before
+it takes traffic.
+
 ## Examples
 
 | Example | Shows | Needs |
@@ -106,6 +133,7 @@ Bevy mapping:
 | `researcher` | Requirement tree, ✓/✗ diagnostics, per-task context | nothing |
 | `triage` | Support-ticket triage: typed `enum` output, retrieval of similar past tickets, malformed model output as a domain error, concurrent runs of one prepared agent. `cargo test --example triage` tests the same agent with fakes. | nothing (fake LLM); optionally a real provider |
 | `live` | A small assistant against a real model | a provider feature and credentials |
+| `worldfn-axum` `chat_server` | Chat page: question in, progress + answer streamed over SSE | nothing (fake LLM); optionally a real provider |
 
 Examples that accept a real model read `WORLDFN_PROVIDER` / `WORLDFN_MODEL`
 (see below) and otherwise fall back to a fake.
@@ -167,5 +195,5 @@ MSRV is 1.85 (edition 2024) for the core, which has no dependencies. The
 tested on stable 1.94. `tokio` is a dev-dependency.
 
 ```sh
-cargo test --all-features   # includes provider tests against a local mock server
+cargo test --workspace --all-features   # core, providers (mock server), axum adapter
 ```

@@ -96,10 +96,7 @@ impl<S: ContextSource> AgentParam for Context<S> {
             S::materialize(deps)
                 .await
                 .map(Context)
-                .map_err(|e| ParamError {
-                    param: type_name::<Self>(),
-                    message: e.0,
-                })
+                .map_err(|e| ParamError::failed(type_name::<Self>(), e.0))
         })
     }
 }

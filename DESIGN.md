@@ -109,6 +109,31 @@ Consequences:
   parameter that fails to resolve, such as a failing retrieval, is still an
   error (§9: only explicitly optional context may degrade).
 
+## Framework seams
+
+worldfn must stay usable from any web framework (and from none), so the core
+depends on no framework and meets them at three points:
+
+- **Inputs:** a framework handler turns request data into a `Scope`. Nothing
+  in an agent signature is an HTTP type.
+- **Streaming output:** `Emit<E>` is a per-invocation capability like
+  `Input<T>`: the caller puts an `Emitter<E>` in the scope and keeps the
+  `EventStream<E>`. The channel is implemented in the core with only `std`
+  (a mutex-protected queue plus a waker), so it works with any executor.
+  `poll_next` is the hook adapters use to implement their framework's stream
+  type. It is unbounded, and it ends when the last emitter drops, which
+  happens when the run finishes. If the receiver is dropped (the client
+  disconnected), `send` returns `false`, so agents can stop early.
+- **Errors:** `RunError::http_status` classifies failures without naming a
+  framework: a missing scope value is the caller's fault (400), a failing
+  parameter backend is upstream (502), and missing bindings or stale agents
+  are setup errors (500). `ParamError::kind` carries the distinction.
+
+`SseFrame`/`SseEvent` describe events in wire terms without choosing a
+serializer; the event type decides its own `data`. Adapters (`worldfn-axum`
+first) are separate crates in the workspace, so the compiler enforces that the
+core never grows a framework dependency.
+
 ## Arity and the `Marker` parameter
 
 Rust has no variadic generics. `macro_rules! all_tuples` generates

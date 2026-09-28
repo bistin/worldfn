@@ -27,6 +27,9 @@ pub enum Requirement {
     /// An [`Input<T>`](crate::Input) from the invocation [`Scope`]. Only
     /// checked when the agent is started, since inputs vary per invocation.
     Input { type_name: &'static str },
+    /// An [`Emit<E>`](crate::Emit) event sink from the invocation [`Scope`].
+    /// Like inputs, only checked when the agent is started.
+    Emit { type_name: &'static str },
     /// A [`Context<S>`](crate::Context) materialized per invocation, and what
     /// materializing it needs.
     Context {
@@ -38,6 +41,12 @@ pub enum Requirement {
 }
 
 impl Requirement {
+    /// Supplied per invocation through the [`Scope`], so it can only be
+    /// checked when an agent is started, not when it is prepared.
+    pub fn is_per_invocation(&self) -> bool {
+        matches!(self, Requirement::Input { .. } | Requirement::Emit { .. })
+    }
+
     /// Whether `other` refers to the same declared requirement. Contexts are
     /// matched by type alone, because an unmet context carries only its unmet
     /// needs.
@@ -60,6 +69,7 @@ impl fmt::Display for Requirement {
             Requirement::Service { type_name } => write!(f, "{}", short_type_name(type_name)),
             Requirement::Resource { type_name } => write!(f, "Res<{}>", short_type_name(type_name)),
             Requirement::Input { type_name } => write!(f, "Input<{}>", short_type_name(type_name)),
+            Requirement::Emit { type_name } => write!(f, "Emit<{}>", short_type_name(type_name)),
             Requirement::Context { type_name, .. } => {
                 write!(f, "Context<{}>", short_type_name(type_name))
             }

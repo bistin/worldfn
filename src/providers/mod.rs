@@ -17,7 +17,7 @@ mod openai_compat;
 #[cfg(feature = "codex")]
 pub use codex::CodexLlm;
 #[cfg(feature = "openai-compat")]
-pub use openai_compat::OpenAiCompatLlm;
+pub use openai_compat::{JsonMode, OpenAiCompatLlm};
 
 use crate::LlmError;
 

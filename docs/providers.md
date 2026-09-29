@@ -90,6 +90,36 @@ world.provide_llm(OpenAiCompatLlm::new("http://localhost:11434/v1", "unused", "l
 Each call sends an optional `.system(..)` message plus one user message, and
 returns `choices[0].message.content`.
 
+## What gets sent
+
+Both providers take the full `ChatRequest`:
+
+| `ChatRequest` | OpenAI-compatible (`/chat/completions`) | Codex (Responses API) |
+|---|---|---|
+| `system` (or the provider's default) | `system` message | `instructions` |
+| user / assistant text | `user` / `assistant` messages | `message` items (`input_text` / `output_text`) |
+| assistant tool calls | `assistant.tool_calls` | `function_call` items |
+| tool results | `tool` messages (`is_error` → `Error: ` prefix) | `function_call_output` items |
+| `tools` | `tools[].function` | `tools[]` (`type: function`) |
+| `OutputFormat::Json` | depends on `JsonMode` (below) | schema in `instructions`; `text.format` too with `.native_structured_output(true)` |
+| `max_output_tokens` | `max_tokens` | not sent (undocumented on the Codex backend) |
+
+Replies come back as one assistant message with text and/or tool calls, a
+`FinishReason` (`Stop`, `ToolCalls`, `Length`, `ContentFilter`), and usage
+when the provider reports it. On Codex, tool calls are collected from the
+stream (`response.output_item.done`) and from the final response.
+
+JSON output on OpenAI-compatible servers, since support differs:
+
+| `JsonMode` | Sends | Default for |
+|---|---|---|
+| `Schema` | `response_format: json_schema` | `OpenAiCompatLlm::openai` |
+| `Object` | `response_format: json_object` + schema in the system prompt | `OpenAiCompatLlm::deepseek` |
+| `Instructions` | schema in the system prompt only | `OpenAiCompatLlm::new` (any server) |
+
+Whatever the mode, `Llm::complete_as` validates by deserializing and retries
+once with the error shown to the model.
+
 ## Errors
 
 Provider failures are `LlmError` values. They are returned to the agent body,
@@ -99,8 +129,8 @@ status, the provider's error body, and a hint where one helps.
 
 ## Current limits
 
-- One prompt in, text out. There are no chat histories, tool calls, images, or
-  streaming to the agent yet.
+- No tool-calling loop yet: tool calls come back to the agent, which decides
+  what to run. No images, and no token streaming to the agent yet.
 - No retries or backoff.
 - Tests use a local mock server; they check the exact request each provider
   sends and how it parses replies. They cannot exercise the live services from

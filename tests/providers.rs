@@ -244,3 +244,169 @@ async fn openai_compatible_errors_are_llm_errors_not_run_errors() -> TestResult 
     server.await?;
     Ok(())
 }
+
+// ---- Full chat requests: history, tools, tool results, JSON output --------
+
+use worldfn::chat::{
+    ChatRequest, FinishReason, Message, MessageRole, OutputFormat, Part, ToolCall, ToolDefinition,
+    ToolResult,
+};
+use worldfn::providers::JsonMode;
+
+fn tool_round_trip_request() -> ChatRequest {
+    ChatRequest::new()
+        .system("You are a mentor.")
+        .user("Price of 2330?")
+        .message(Message {
+            role: MessageRole::Assistant,
+            parts: vec![Part::ToolCall(ToolCall {
+                id: "call_1".into(),
+                name: "quote".into(),
+                arguments: r#"{"instrument":"TWSE:2330"}"#.into(),
+            })],
+        })
+        .message(Message::tool_result(ToolResult {
+            call_id: "call_1".into(),
+            content: "provider unavailable".into(),
+            is_error: true,
+        }))
+        .user("Then just summarize.")
+        .tool(ToolDefinition {
+            name: "quote".into(),
+            description: "Delayed quote with source and time.".into(),
+            parameters: r#"{"type":"object","properties":{"instrument":{"type":"string"}}}"#.into(),
+        })
+        .output(OutputFormat::Json {
+            name: "Summary".into(),
+            schema: r#"{"type":"object","properties":{"text":{"type":"string"}}}"#.into(),
+        })
+}
+
+#[tokio::test]
+async fn openai_compatible_maps_the_full_request_and_reply() -> TestResult {
+    let reply = json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_2",
+                    "type": "function",
+                    "function": { "name": "quote", "arguments": "{\"instrument\":\"TWSE:2317\"}" },
+                }],
+            },
+        }],
+        "usage": { "prompt_tokens": 120, "completion_tokens": 18 },
+    });
+    let (url, server) = serve_once("200 OK", "application/json", vec![reply.to_string()]).await;
+    let llm = Llm::new(OpenAiCompatLlm::new(&url, "sk", "m").json_mode(JsonMode::Schema));
+
+    let response = llm.chat(tool_round_trip_request()).await?;
+    assert_eq!(response.finish, FinishReason::ToolCalls);
+    assert_eq!(
+        response.message.tool_calls().collect::<Vec<_>>(),
+        [&ToolCall {
+            id: "call_2".into(),
+            name: "quote".into(),
+            arguments: r#"{"instrument":"TWSE:2317"}"#.into(),
+        }]
+    );
+    let usage = response.usage.unwrap();
+    assert_eq!((usage.input_tokens, usage.output_tokens), (120, 18));
+
+    let body = server.await?.body;
+    assert_eq!(
+        body["messages"],
+        json!([
+            { "role": "system", "content": "You are a mentor." },
+            { "role": "user", "content": "Price of 2330?" },
+            { "role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": { "name": "quote", "arguments": "{\"instrument\":\"TWSE:2330\"}" },
+            }] },
+            { "role": "tool", "tool_call_id": "call_1", "content": "Error: provider unavailable" },
+            { "role": "user", "content": "Then just summarize." },
+        ])
+    );
+    assert_eq!(body["tools"][0]["function"]["name"], "quote");
+    assert_eq!(
+        body["tools"][0]["function"]["parameters"]["properties"]["instrument"]["type"],
+        "string"
+    );
+    assert_eq!(body["response_format"]["type"], "json_schema");
+    assert_eq!(body["response_format"]["json_schema"]["name"], "Summary");
+    Ok(())
+}
+
+#[tokio::test]
+async fn deepseek_style_json_mode_uses_json_object_and_instructions() -> TestResult {
+    let reply = json!({ "choices": [{ "finish_reason": "stop",
+        "message": { "role": "assistant", "content": "{\"text\":\"ok\"}" } }] });
+    let (url, server) = serve_once("200 OK", "application/json", vec![reply.to_string()]).await;
+    let llm = Llm::new(OpenAiCompatLlm::new(&url, "sk", "m").json_mode(JsonMode::Object));
+
+    let response = llm.chat(tool_round_trip_request()).await?;
+    assert_eq!(response.message.text(), "{\"text\":\"ok\"}");
+    assert_eq!(response.finish, FinishReason::Stop);
+    assert!(response.usage.is_none());
+
+    let body = server.await?.body;
+    assert_eq!(body["response_format"], json!({ "type": "json_object" }));
+    let system = body["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.starts_with("You are a mentor.\n\nReply with only a JSON value"),
+        "{system}"
+    );
+    assert!(system.contains("\"text\""), "{system}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn codex_maps_the_full_request_and_streamed_tool_calls() -> TestResult {
+    let events = [
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\
+         \"call_id\":\"call_9\",\"name\":\"quote\",\"arguments\":\"{\\\"instrument\\\":\\\"TWSE:2317\\\"}\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\
+         \"usage\":{\"input_tokens\":300,\"output_tokens\":12}}}\n\n",
+    ];
+    let (url, server) = serve_once(
+        "200 OK",
+        "text/event-stream",
+        events.map(String::from).to_vec(),
+    )
+    .await;
+    let auth = write_auth_json(&scratch_dir("codex-chat"), 3600);
+    let llm = Llm::new(
+        CodexLlm::from_auth_file(&auth, "gpt-test")?
+            .base_url(&url)
+            .native_structured_output(true),
+    );
+
+    let response = llm.chat(tool_round_trip_request()).await?;
+    assert_eq!(response.finish, FinishReason::ToolCalls);
+    assert_eq!(response.message.tool_calls().next().unwrap().id, "call_9");
+    assert_eq!(response.usage.unwrap().input_tokens, 300);
+
+    let body = server.await?.body;
+    assert_eq!(
+        body["input"],
+        json!([
+            { "type": "message", "role": "user",
+              "content": [{ "type": "input_text", "text": "Price of 2330?" }] },
+            { "type": "function_call", "call_id": "call_1", "name": "quote",
+              "arguments": "{\"instrument\":\"TWSE:2330\"}" },
+            { "type": "function_call_output", "call_id": "call_1",
+              "output": "Error: provider unavailable" },
+            { "type": "message", "role": "user",
+              "content": [{ "type": "input_text", "text": "Then just summarize." }] },
+        ])
+    );
+    let instructions = body["instructions"].as_str().unwrap();
+    assert!(instructions.starts_with("You are a mentor.\n\nReply with only a JSON value"));
+    assert_eq!(body["tools"][0]["type"], "function");
+    assert_eq!(body["tools"][0]["name"], "quote");
+    assert_eq!(body["text"]["format"]["type"], "json_schema");
+    Ok(())
+}

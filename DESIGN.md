@@ -145,6 +145,39 @@ Cache keys length-prefix ids so they cannot collide across accounts.
 `store::conformance` holds the shared behavioral tests; backend crates run it
 against their own stores.
 
+## The LLM contract
+
+`LlmProvider` has one method: `chat(ChatRequest) -> ChatResponse`. The types
+live in the core (`worldfn::chat`) and are shaped after what current SDKs
+converge on:
+- a system prompt;
+- messages made of text, tool-call and tool-result parts;
+- tool definitions;
+- an output format;
+- in the reply, a finish reason and token usage.
+
+Owning them, rather than adopting a crate's types, keeps the core free of
+provider dependencies and lets `FakeLlm` script any reply, including tool
+calls, without a network. A broad provider crate (e.g. rig) can still be
+wrapped as one `LlmProvider` adapter later.
+
+JSON payloads (tool arguments, schemas) are JSON *text* in these types. That
+keeps `--no-default-features` dependency-free. The `structured` feature adds
+`Llm::complete_as::<T>()`, which:
+- generates the schema from `T` with `schemars`;
+- sends it as the output format;
+- validates the reply by deserializing into `T`;
+- on failure, shows the model its reply and the error and asks again, up to a
+  retry limit.
+
+A truncated reply (`FinishReason::Length`) is never parsed. Rules a type
+cannot express, such as a non-empty string, stay in the caller's code, as the
+triage example shows.
+
+Deliberately not in the contract yet: a tool-calling loop. The agent gets tool
+calls back and decides what to run, in keeping with §3 (no hidden loop). Also
+missing: token streaming and images.
+
 ## Skills
 
 Agent Skills are progressive disclosure: a catalog (level 1), full

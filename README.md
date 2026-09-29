@@ -99,6 +99,34 @@ Bevy mapping:
 | `FunctionSystem` | `FunctionAgent` |
 | `SystemState` | `prepare` |
 
+## Talking to models
+
+`Llm` takes a provider-neutral `ChatRequest` (system prompt, messages of text /
+tool-call / tool-result parts, tool definitions, output format) and returns one
+assistant `ChatResponse` (message, finish reason, token usage). The shapes follow
+what current SDKs converge on (Vercel AI SDK, pi-ai, rig); worldfn owns these
+types so the core has no provider dependency.
+
+```rust
+// Plain text.
+let text = llm.complete("Summarize this").await?;
+
+// Typed reply: the JSON Schema comes from the type, the reply is validated by
+// deserializing into it, and invalid output gets one corrective retry.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct Triage { category: Category, priority: Priority, reply: String }
+
+let triage: Triage = llm
+    .complete_as(ChatRequest::new().system("You triage tickets.").user(ticket_text))
+    .await?;
+```
+
+Typed replies are the `structured` feature (on by default; it adds `serde`,
+`serde_json` and `schemars`). Providers map the request to their wire format,
+including tool definitions, tool calls and results, and native JSON output
+where it exists. See `docs/providers.md`. Running tools on the model's behalf
+(a tool-calling loop) comes next.
+
 ## Skills
 
 worldfn reads standard [Agent Skills](https://agentskills.io/specification)
@@ -245,7 +273,9 @@ cargo clippy --all-targets
 cargo run --example researcher
 ```
 
-MSRV is 1.85 (edition 2024) for the core, which has no dependencies. The
+MSRV is 1.85 (edition 2024). The core has no dependencies with
+`--no-default-features`; the default `structured` feature adds serde and
+schemars. The
 `codex` / `openai-compat` features add `reqwest` and `serde_json` and are
 tested on stable 1.94. `tokio` is a dev-dependency.
 

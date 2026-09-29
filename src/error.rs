@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::fmt;
 
+use crate::param::short_type_name;
 use crate::{AgentMeta, Requirement};
 
 /// A runtime-layer failure: the agent could not be prepared or started.
@@ -46,6 +47,30 @@ impl fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
+impl RunError {
+    /// Whether the caller of this invocation is at fault (it left an input or
+    /// event sink out of the scope), as opposed to the server's setup or an
+    /// upstream dependency. Framework adapters map this to 4xx vs 5xx.
+    pub fn is_caller_error(&self) -> bool {
+        matches!(
+            self,
+            RunError::Param { error, .. } if error.kind == ParamErrorKind::MissingFromScope
+        )
+    }
+
+    /// A suggested HTTP status, for framework adapters:
+    /// 400 for caller errors, 502 when a parameter's backend failed
+    /// (e.g. retrieval), 500 for setup errors (missing bindings, stale or
+    /// unprepared agents).
+    pub fn http_status(&self) -> u16 {
+        match self {
+            _ if self.is_caller_error() => 400,
+            RunError::Param { .. } => 502,
+            _ => 500,
+        }
+    }
+}
+
 /// Which declared requirements are satisfied, for one agent and one world.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostics {
@@ -55,8 +80,17 @@ pub struct Diagnostics {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
+    /// The requirement as declared by the signature.
     pub requirement: Requirement,
-    pub satisfied: bool,
+    /// `None` if satisfied. Otherwise the unmet part: for a context, only
+    /// the needs that are missing.
+    pub unmet: Option<Requirement>,
+}
+
+impl Check {
+    pub fn satisfied(&self) -> bool {
+        self.unmet.is_none()
+    }
 }
 
 impl Diagnostics {
@@ -66,7 +100,7 @@ impl Diagnostics {
             .iter()
             .map(|requirement| Check {
                 requirement: requirement.clone(),
-                satisfied: !missing.contains(requirement),
+                unmet: missing.iter().find(|m| requirement.same_as(m)).cloned(),
             })
             .collect();
         Self {
@@ -75,10 +109,11 @@ impl Diagnostics {
         }
     }
 
+    /// The declared requirements that are not satisfied.
     pub fn missing(&self) -> impl Iterator<Item = &Requirement> {
         self.checks
             .iter()
-            .filter(|c| !c.satisfied)
+            .filter(|c| !c.satisfied())
             .map(|c| &c.requirement)
     }
 }
@@ -87,16 +122,22 @@ impl Diagnostics {
 /// Cannot prepare researcher:
 ///   ✓ Llm
 ///   ✗ Tool<web_search>: no provider registered
-///   ✓ Context<RelevantMemory>
+///   ✗ Context<RelevantMemory>: needs Memory
 /// ```
 impl fmt::Display for Diagnostics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Cannot prepare {}:", self.agent)?;
         for check in &self.checks {
-            if check.satisfied {
-                write!(f, "\n  ✓ {}", check.requirement)?;
-            } else {
-                write!(f, "\n  ✗ {}: no provider registered", check.requirement)?;
+            match &check.unmet {
+                None if check.requirement.is_per_invocation() => {
+                    write!(f, "\n  · {}: checked when started", check.requirement)?
+                }
+                None => write!(f, "\n  ✓ {}", check.requirement)?,
+                Some(Requirement::Context { needs, .. }) => {
+                    let needs: Vec<_> = needs.iter().map(ToString::to_string).collect();
+                    write!(f, "\n  ✗ {}: needs {}", check.requirement, needs.join(", "))?
+                }
+                Some(_) => write!(f, "\n  ✗ {}: no provider registered", check.requirement)?,
             }
         }
         Ok(())
@@ -107,7 +148,36 @@ impl fmt::Display for Diagnostics {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamError {
     pub param: &'static str,
+    pub kind: ParamErrorKind,
     pub message: String,
+}
+
+/// Why a parameter failed to resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamErrorKind {
+    /// The caller did not supply a per-invocation value (an `Input` or an
+    /// `Emit` sink) in the `Scope`.
+    MissingFromScope,
+    /// Resolution itself failed, e.g. a retrieval backend errored.
+    Failed,
+}
+
+impl ParamError {
+    pub fn missing_from_scope(param: &'static str) -> Self {
+        Self {
+            param,
+            kind: ParamErrorKind::MissingFromScope,
+            message: "not present in the invocation scope".into(),
+        }
+    }
+
+    pub fn failed(param: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            param,
+            kind: ParamErrorKind::Failed,
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for ParamError {
@@ -115,7 +185,8 @@ impl fmt::Display for ParamError {
         write!(
             f,
             "parameter `{}` failed to resolve: {}",
-            self.param, self.message
+            short_type_name(self.param),
+            self.message
         )
     }
 }

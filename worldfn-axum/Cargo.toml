@@ -1,0 +1,22 @@
+[package]
+name = "worldfn-axum"
+version = "0.1.0"
+edition = "2024"
+description = "axum adapter for worldfn: SSE from Emit<E>, RunError as HTTP responses"
+license = "MIT OR Apache-2.0"
+
+[features]
+# Forwarded so examples can use real providers.
+codex = ["worldfn/codex"]
+openai-compat = ["worldfn/openai-compat"]
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "query"] }
+futures-core = "0.3"
+worldfn = { path = ".." }
+
+[dev-dependencies]
+http-body-util = "0.1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tower = { version = "0.5", features = ["util"] }

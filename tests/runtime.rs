@@ -27,16 +27,20 @@ fn hit(title: &str) -> SearchHit {
     }
 }
 
+fn task(task: &str) -> Scope {
+    Scope::of(Task::new(task))
+}
+
 fn research_world(
     llm: FakeLlm,
     web: FakeTool<WebSearch>,
-    memory: RelevantMemory,
+    memory: FakeMemory,
 ) -> Result<AgentWorld, BindError> {
     let mut world = AgentWorld::new();
     world
         .provide_llm(llm)?
         .provide_tool::<WebSearch>(web)?
-        .provide_context(memory)?;
+        .provide_memory(memory)?;
     Ok(world)
 }
 
@@ -48,16 +52,23 @@ async fn researcher_runs_on_fakes() -> TestResult {
     let world = research_world(
         llm.clone(),
         web.clone(),
-        RelevantMemory::new(["prefers tokio"]),
+        FakeMemory::new(["prefers tokio for async", "the cat is called Ferris"]),
     )?;
 
-    let answer = world.run(researcher).await?;
+    let answer = world
+        .run_with(researcher, task("explain async rust"))
+        .await?;
 
     assert_eq!(answer, Answer("futures are lazy".into()));
     assert_eq!(web.requests(), vec!["rust async".to_string()]);
     let prompts = llm.prompts();
     assert_eq!(prompts.len(), 1);
     assert!(prompts[0].contains("async-book") && prompts[0].contains("prefers tokio"));
+    assert!(
+        !prompts[0].contains("Ferris"),
+        "irrelevant memory: {}",
+        prompts[0]
+    );
     Ok(())
 }
 
@@ -78,6 +89,14 @@ fn metadata_matches_signature() {
                 },
                 Requirement::Context {
                     type_name: std::any::type_name::<RelevantMemory>(),
+                    needs: vec![
+                        Requirement::Service {
+                            type_name: std::any::type_name::<Memory>(),
+                        },
+                        Requirement::Input {
+                            type_name: std::any::type_name::<Task>(),
+                        },
+                    ],
                 },
             ],
         }
@@ -87,7 +106,9 @@ fn metadata_matches_signature() {
         "researcher\n\
          ├── requires Llm\n\
          ├── can call Tool<web_search>\n\
-         └── requires Context<RelevantMemory>"
+         └── requires Context<RelevantMemory>\n    \
+             ├── requires Memory\n    \
+             └── reads Input<Task>"
     );
 }
 
@@ -113,7 +134,7 @@ async fn missing_dependencies_fail_before_body() -> TestResult {
         "Cannot prepare agent:\n  \
          ✓ Llm\n  \
          ✗ Tool<web_search>: no provider registered\n  \
-         ✗ Context<RelevantMemory>: no provider registered"
+         ✗ Context<RelevantMemory>: needs Memory"
     );
     assert_eq!(world.prepare(agent).err(), Some(err));
     Ok(())
@@ -128,12 +149,19 @@ async fn same_agent_different_isolated_worlds() -> TestResult {
         FakeTool::with_response(vec![hit("a")]),
         FakeTool::with_response(vec![]),
     );
-    let world_a = research_world(llm_a.clone(), web_a.clone(), RelevantMemory::default())?;
-    let world_b = research_world(llm_b.clone(), web_b.clone(), RelevantMemory::new(["m"]))?;
+    let world_a = research_world(llm_a.clone(), web_a.clone(), FakeMemory::default())?;
+    let world_b = research_world(
+        llm_b.clone(),
+        web_b.clone(),
+        FakeMemory::new(["rust notes"]),
+    )?;
 
-    assert_eq!(world_a.run(researcher).await?, Answer("A".into()));
-    let echoed = world_b.run(researcher).await?;
-    assert!(echoed.0.contains("[\"m\"]"), "{echoed:?}");
+    assert_eq!(
+        world_a.run_with(researcher, task("rust")).await?,
+        Answer("A".into())
+    );
+    let echoed = world_b.run_with(researcher, task("rust")).await?;
+    assert!(echoed.0.contains("[\"rust notes\"]"), "{echoed:?}");
 
     assert_eq!((llm_a.calls(), web_a.calls()), (1, 1));
     assert_eq!((llm_b.calls(), web_b.calls()), (1, 1));
@@ -236,14 +264,14 @@ async fn arities_zero_one_three_and_max() -> TestResult {
     let mut world = research_world(
         FakeLlm::new(),
         FakeTool::failing("x"),
-        RelevantMemory::default(),
+        FakeMemory::default(),
     )?;
     world.provide(7u32)?.provide(String::from("s"))?;
 
     assert_eq!(world.run(zero).await?, 0);
     assert_eq!(world.run(one).await?, 1);
-    assert_eq!(world.run(three).await?, 3);
-    assert_eq!(world.run(eight).await?, 8);
+    assert_eq!(world.run_with(three, task("t")).await?, 3);
+    assert_eq!(world.run_with(eight, task("t")).await?, 8);
     Ok(())
 }
 
@@ -255,6 +283,7 @@ struct Counted {
 
 impl AgentParam for Counted {
     type State = Arc<AtomicUsize>;
+    type Future = std::future::Ready<Result<Self, ParamError>>;
 
     fn describe(out: &mut Vec<Requirement>) {
         out.push(Requirement::Resource {
@@ -276,13 +305,13 @@ impl AgentParam for Counted {
         Ok(inits)
     }
 
-    fn resolve(state: &mut Self::State, world: &AgentWorld) -> Result<Self, ParamError> {
+    fn resolve(state: &mut Self::State, world: &AgentWorld, _scope: &Scope) -> Self::Future {
         let resolves = world.resource::<Counters>().unwrap().resolves.clone();
         resolves.fetch_add(1, Ordering::SeqCst);
-        Ok(Counted {
+        std::future::ready(Ok(Counted {
             inits: state.clone(),
             resolves,
-        })
+        }))
     }
 }
 
@@ -341,7 +370,7 @@ async fn stale_and_foreign_prepared_state_is_rejected() -> TestResult {
     let other = research_world(
         FakeLlm::echo(),
         FakeTool::failing("x"),
-        RelevantMemory::default(),
+        FakeMemory::default(),
     )?;
     assert!(matches!(
         other.run_prepared(&mut agent).await,
@@ -421,9 +450,9 @@ async fn run_future_is_static_and_spawnable() -> TestResult {
     let world = research_world(
         FakeLlm::with_answer("ok"),
         FakeTool::with_response(vec![]),
-        RelevantMemory::default(),
+        FakeMemory::default(),
     )?;
-    let handle = tokio::spawn(world.run(researcher));
+    let handle = tokio::spawn(world.run_with(researcher, task("t")));
     drop(world);
     assert_eq!(handle.await??, Answer("ok".into()));
     Ok(())

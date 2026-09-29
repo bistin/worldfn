@@ -29,9 +29,12 @@
 //! world
 //!     .provide_llm(FakeLlm::with_answer("42"))?
 //!     .provide_tool::<WebSearch>(FakeTool::with_response(vec![]))?
-//!     .provide_context(RelevantMemory::new(["likes tokio"]))?;
+//!     .provide_memory(FakeMemory::new(["user prefers tokio for async"]))?;
 //!
-//! let answer = world.run(researcher).await?;
+//! // The context is materialized for this task, before the body runs.
+//! let answer = world
+//!     .run_with(researcher, Scope::of(Task::new("explain rust async")))
+//!     .await?;
 //! assert_eq!(answer, Answer("42".into()));
 //! # Ok(())
 //! # })
@@ -64,21 +67,34 @@
 
 mod agent;
 mod context;
+pub mod emit;
 mod error;
 mod function;
+mod input;
 mod llm;
+mod memory;
 mod param;
+#[cfg(feature = "http")]
+pub mod providers;
+pub mod scoped;
+pub mod skills;
+pub mod store;
 mod tool;
 mod world;
 
 pub use agent::{
     Agent, AgentFuture, AgentMeta, FunctionAgent, IntoAgent, IsAgent, IsFunctionAgent,
 };
-pub use context::{Context, RelevantMemory};
-pub use error::{BindError, Check, Diagnostics, ParamError, RunError};
+pub use context::{Context, ContextError, ContextSource, RelevantMemory};
+pub use emit::{Emit, EventStream, SseEvent, SseFrame};
+pub use error::{BindError, Check, Diagnostics, ParamError, ParamErrorKind, RunError};
 pub use function::AgentFunction;
+pub use input::{Input, Scope, Task};
 pub use llm::{FakeLlm, Llm, LlmError, LlmProvider};
+pub use memory::{FakeMemory, Memory, MemoryStore};
 pub use param::{AgentParam, Requirement, Res};
+pub use scoped::{AccountMemory, Conversation, Principal, Recall, SessionLog};
+pub use skills::{AsQuery, RelevantSkills, Skill, SkillCatalog, SkillLibrary, Skills};
 pub use tool::{FakeTool, SearchHit, Tool, ToolError, ToolHandler, ToolSpec, WebSearch};
 pub use world::AgentWorld;
 
@@ -86,9 +102,12 @@ pub use world::AgentWorld;
 pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 pub mod prelude {
+    pub use crate::{AccountMemory, Conversation, Principal, Recall, SessionLog};
     pub use crate::{
-        Agent, AgentParam, AgentWorld, Context, FakeLlm, FakeTool, IntoAgent, Llm, RelevantMemory,
-        Requirement, Res, RunError, Tool, ToolSpec, WebSearch,
+        Agent, AgentParam, AgentWorld, Context, ContextError, ContextSource, Emit, FakeLlm,
+        FakeMemory, FakeTool, Input, IntoAgent, Llm, Memory, RelevantMemory, RelevantSkills,
+        Requirement, Res, RunError, Scope, SkillCatalog, SkillLibrary, Skills, Task, Tool,
+        ToolSpec, WebSearch,
     };
 }
 

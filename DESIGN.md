@@ -174,9 +174,29 @@ A truncated reply (`FinishReason::Length`) is never parsed. Rules a type
 cannot express, such as a non-empty string, stay in the caller's code, as the
 triage example shows.
 
-Deliberately not in the contract yet: a tool-calling loop. The agent gets tool
-calls back and decides what to run, in keeping with §3 (no hidden loop). Also
-missing: token streaming and images.
+### Tool calling
+
+`Toolbox<(A, B, ..)>` is a parameter like any other. The tuple is the model's
+whole tool surface: definitions are generated from each `ToolSpec` (name,
+`DESCRIPTION`, and a schema from `Request`), and `dispatch` only reaches
+handlers in the tuple. The model's arguments are untrusted input. They are
+deserialized into `Request` before any handler runs. Bad arguments, handler
+errors, and calls to unlisted tools become error results the model sees, so it
+can recover, and they never become panics or runtime errors.
+
+`Toolbox::run` is the loop: call the model, run the requested tools in order,
+append calls and results, and repeat until the model answers or `max_steps`
+model calls are used (`ToolLoopError::MaxSteps`). It is a method the agent
+calls, with a visible bound, not something the runtime does around the agent
+(§3). An observer callback sees each call and result, which is how progress
+reaches an `Emit` stream. Agents that need other control flow, such as
+approval before a tool runs or parallel calls, use `definitions` and
+`dispatch` themselves.
+
+Tool arguments must be JSON objects, so a non-object `Request` (e.g.
+`String`) is wrapped as `{"input": ...}` and unwrapped on dispatch.
+
+Still missing: token streaming and images.
 
 ## Skills
 

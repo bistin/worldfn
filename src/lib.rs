@@ -83,6 +83,8 @@ pub mod store;
 #[cfg(feature = "structured")]
 pub mod structured;
 mod tool;
+#[cfg(feature = "structured")]
+pub mod toolbox;
 mod world;
 
 pub use agent::{
@@ -102,6 +104,8 @@ pub use skills::{AsQuery, RelevantSkills, Skill, SkillCatalog, SkillLibrary, Ski
 #[cfg(feature = "structured")]
 pub use structured::StructuredError;
 pub use tool::{FakeTool, SearchHit, Tool, ToolError, ToolHandler, ToolSpec, WebSearch};
+#[cfg(feature = "structured")]
+pub use toolbox::{LoopEvent, ToolLoopError, ToolRun, Toolbox};
 pub use world::AgentWorld;
 
 /// A boxed, `Send` future, used at type-erased provider boundaries.

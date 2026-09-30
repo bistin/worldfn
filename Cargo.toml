@@ -26,7 +26,7 @@ http = ["dep:reqwest", "dep:serde_json"]
 [dependencies]
 base64 = { version = "0.22", optional = true }
 schemars = { version = "1", optional = true }
-serde = { version = "1", optional = true }
+serde = { version = "1", optional = true, features = ["derive"] }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "http2"] }
 serde_json = { version = "1", optional = true }
 
@@ -45,4 +45,8 @@ required-features = ["http"]
 [[example]]
 name = "triage"
 test = true
+required-features = ["structured"]
+
+[[example]]
+name = "mentor_tools"
 required-features = ["structured"]

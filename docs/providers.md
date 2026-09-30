@@ -129,8 +129,8 @@ status, the provider's error body, and a hint where one helps.
 
 ## Current limits
 
-- No tool-calling loop yet: tool calls come back to the agent, which decides
-  what to run. No images, and no token streaming to the agent yet.
+- Tool calls within one model turn run sequentially in `Toolbox::run`.
+- No images, and no token streaming to the agent yet.
 - No retries or backoff.
 - Tests use a local mock server; they check the exact request each provider
   sends and how it parses replies. They cannot exercise the live services from

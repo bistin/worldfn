@@ -3,6 +3,7 @@
 //! | Feature | Provider | Auth |
 //! |---|---|---|
 //! | `codex` | [`CodexLlm`] | ChatGPT subscription, via the official Codex CLI's saved login |
+//! | `codex-login` | [`CodexLlm::from_login`] + [`codex_login`] | ChatGPT subscription, via worldfn's own login (`worldfn login codex`) |
 //! | `openai-compat` | [`OpenAiCompatLlm`] | API key: OpenAI, DeepSeek, or any compatible server |
 //!
 //! Both are type-erased behind [`Llm`](crate::Llm), so agents never name a
@@ -11,6 +12,8 @@
 
 #[cfg(feature = "codex")]
 mod codex;
+#[cfg(feature = "codex-login")]
+pub mod codex_login;
 #[cfg(feature = "openai-compat")]
 mod openai_compat;
 

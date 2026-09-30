@@ -255,10 +255,16 @@ Providers are opt-in cargo features:
 |---|---|
 | `openai-compat` | `OpenAiCompatLlm`: API-key access to DeepSeek, OpenAI, or any compatible server |
 | `codex` | `CodexLlm`: your ChatGPT subscription through the official Codex CLI's saved login. **Unofficial; personal experiments only.** |
+| `codex-login` | Adds worldfn's own ChatGPT login (`worldfn login codex`, browser or device code) with automatic token refresh, so the Codex CLI is not needed. Same caveats. |
 
 ```sh
 WORLDFN_PROVIDER=deepseek WORLDFN_MODEL=deepseek-v4-flash DEEPSEEK_API_KEY=sk-... \
   cargo run --example live --features openai-compat -- "your question"
+
+# ChatGPT plan: sign in once, then use it like any provider
+cargo run --features codex-login --bin worldfn -- login codex   # add --device without a browser
+WORLDFN_PROVIDER=codex WORLDFN_MODEL=gpt-5.5 \
+  cargo run --example live --features codex-login -- "your question"
 ```
 
 Setup, caveats, and the Codex terms risk are in
@@ -303,8 +309,9 @@ cargo run --example researcher
 MSRV is 1.85 (edition 2024). The core has no dependencies with
 `--no-default-features`; the default `structured` feature adds serde and
 schemars. The
-`codex` / `openai-compat` features add `reqwest` and `serde_json` and are
-tested on stable 1.94. `tokio` is a dev-dependency.
+`codex` / `openai-compat` features add `reqwest` and `serde_json`
+(`codex-login` also `sha2`, `getrandom`, and `tokio`) and are tested on
+stable 1.94. `tokio` is a dev-dependency.
 
 ```sh
 cargo test --workspace --all-features   # core, providers (mock server), axum adapter

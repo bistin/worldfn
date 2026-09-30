@@ -8,6 +8,7 @@ touches agent code.
 |---|---|---|---|
 | none | `FakeLlm` | none | none; deterministic, for tests |
 | `codex` | `providers::CodexLlm` | ChatGPT subscription, via the official Codex CLI's saved login | `chatgpt.com/backend-api/codex/responses` (unofficial) |
+| `codex-login` | `CodexLlm::from_login` | ChatGPT subscription, via worldfn's own login (`worldfn login codex`) | same |
 | `openai-compat` | `providers::OpenAiCompatLlm` | API key | any OpenAI-compatible `/chat/completions`: DeepSeek, OpenAI, local servers |
 
 Try either one with the `live` example:
@@ -34,25 +35,73 @@ tested on stable 1.94.
 > interactive-scale experiments. Do not use it in a service, for batch jobs, or
 > for other people. For those, use an API key (`OpenAiCompatLlm::openai`).
 
-How it works:
+There are two ways to sign in. Both end with the same requests.
+
+### Option 1: worldfn's own login (feature `codex-login`)
+
+This works like pi's `/login`. The Codex CLI is not needed.
+
+```sh
+cargo run --features codex-login --bin worldfn -- login codex            # browser
+cargo run --features codex-login --bin worldfn -- login codex --device   # no browser (SSH, containers)
+cargo run --features codex-login --bin worldfn -- status
+cargo run --features codex-login --bin worldfn -- logout codex
+# or install it: cargo install --path . --features codex-login --bin worldfn
+```
+
+- **Browser.** worldfn prints a sign-in URL on `auth.openai.com` and tries to
+  open it. After you sign in, the browser redirects to
+  `http://localhost:1455/auth/callback`, which worldfn serves while it waits.
+  The flow uses PKCE, and worldfn ignores callbacks whose `state` does not
+  match. If port 1455 is busy, or the browser runs on another machine, copy
+  the URL of the page the browser ends on and paste it into the terminal.
+- **Device code.** worldfn shows a code. Enter it at
+  `auth.openai.com/codex/device` on any device. worldfn polls for up to 15
+  minutes. If this reports "not enabled", device login is not available for
+  your account; use the browser login.
+- **Tokens** are saved to `~/.worldfn/auth.json`, or `$WORLDFN_HOME/auth.json`.
+  The file has mode `0600` and its directory `0700`. worldfn never sees your
+  password. `status` never prints tokens. Do not paste this file into chats or
+  issues.
+- **Refresh.** `CodexLlm::from_login(model)` refreshes the access token when
+  it has less than 5 minutes left, writes the new one back, and refreshes only
+  once when calls run concurrently. If the refresh token has been revoked, the
+  error tells you to run `worldfn login codex` again.
+
+```rust
+world.provide_llm(CodexLlm::from_login("gpt-5.5")?.reasoning_effort("low"))?;
+```
+
+The OAuth parameters (client id, scopes, redirect, and device endpoints) are
+the ones OpenAI's own Codex clients use, as pi's `openai-codex` login does.
+This is the part most likely to break, and the part most likely to conflict
+with OpenAI's terms. The note above applies with extra force.
+
+### Option 2: reuse the official Codex CLI login (feature `codex`)
 
 1. Log in with the **official** Codex CLI: `codex login`, and choose ChatGPT.
    It saves tokens to `$CODEX_HOME/auth.json`, or `~/.codex/auth.json` by
-   default. worldfn implements no login flow of its own and never handles
-   your password.
+   default.
 2. `CodexLlm::from_codex_home(model)` reads that file. It re-reads the file on
    every call, so when the Codex CLI refreshes the token, the next call picks it
    up.
-3. worldfn **never refreshes tokens itself**. When the saved token expires, the
-   next call fails with a message telling you to run `codex` (which refreshes
-   the login) or `codex login` again.
-4. Requests follow the open-source Codex CLI and pi's `openai-codex` provider:
-   a Responses-API body with `store: false` and `stream: true`, the
-   `chatgpt-account-id` and `OpenAI-Beta: responses=experimental` headers, and
-   a server-sent-event reply. The client identifies itself honestly as
-   `originator: worldfn`.
+3. In this mode worldfn **never refreshes tokens itself**, because the Codex
+   CLI owns that file. When the saved token expires, the next call fails with a
+   message telling you to run `codex` (which refreshes the login) or
+   `codex login` again.
 
-It will not work if:
+The examples use option 1 when `~/.worldfn/auth.json` has a login and the
+`codex-login` feature is on, and option 2 otherwise.
+
+### Requests
+
+Requests follow the open-source Codex CLI and pi's `openai-codex` provider:
+a Responses-API body with `store: false` and `stream: true`, the
+`chatgpt-account-id` and `OpenAI-Beta: responses=experimental` headers, and a
+server-sent-event reply. The client identifies itself honestly as
+`originator: worldfn`.
+
+Option 2 will not work if:
 
 - you logged into Codex with an API key rather than ChatGPT; there are no
   ChatGPT tokens in `auth.json` in that case,

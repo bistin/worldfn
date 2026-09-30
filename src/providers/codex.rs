@@ -28,15 +28,19 @@ const PROVIDER: &str = "codex";
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const DEFAULT_INSTRUCTIONS: &str = "You are a helpful assistant.";
 /// Claim namespace OpenAI uses for ChatGPT account data inside its JWTs.
-const AUTH_CLAIM: &str = "https://api.openai.com/auth";
+pub(super) const AUTH_CLAIM: &str = "https://api.openai.com/auth";
 
-/// An [`LlmProvider`] billed to your ChatGPT plan, using the login saved by
-/// the official Codex CLI. See the module docs for the caveats.
+/// An [`LlmProvider`] billed to your ChatGPT plan. See the module docs for the
+/// caveats.
 ///
-/// Credentials are re-read from disk on every call, so a token refreshed by
-/// the Codex CLI is picked up without restarting. This provider never
-/// refreshes tokens itself: when the saved token expires, run `codex` (or
-/// `codex login`) again.
+/// Two ways to get credentials:
+///
+/// - [`from_login`](Self::from_login) (feature `codex-login`): worldfn's own
+///   login, `worldfn login codex`. The access token is refreshed shortly
+///   before it expires and written back to the token store.
+/// - [`from_codex_home`](Self::from_codex_home): the login saved by the
+///   official Codex CLI. Re-read from disk on every call, so a token the Codex
+///   CLI refreshed is picked up; worldfn never refreshes these itself.
 ///
 /// ```no_run
 /// # use worldfn::{AgentWorld, providers::CodexLlm};
@@ -47,7 +51,7 @@ const AUTH_CLAIM: &str = "https://api.openai.com/auth";
 /// ```
 pub struct CodexLlm {
     http: reqwest::Client,
-    auth_file: PathBuf,
+    source: Source,
     endpoint: String,
     model: String,
     instructions: String,
@@ -69,15 +73,61 @@ impl CodexLlm {
     ) -> Result<Self, LlmError> {
         let auth_file = path.into();
         CodexCredentials::load(&auth_file)?;
-        Ok(Self {
+        Ok(Self::with_source(Source::CodexCli(auth_file), model.into()))
+    }
+
+    /// Use worldfn's own login from the default [`TokenStore`] location
+    /// (`~/.worldfn/auth.json`). Run `worldfn login codex` first.
+    ///
+    /// [`TokenStore`]: super::codex_login::TokenStore
+    #[cfg(feature = "codex-login")]
+    pub fn from_login(model: impl Into<String>) -> Result<Self, LlmError> {
+        let store = super::codex_login::TokenStore::default_location()
+            .map_err(|e| LlmError(format!("{PROVIDER}: {e}")))?;
+        Self::from_token_store(store, model)
+    }
+
+    /// Use worldfn's own login from a specific [`TokenStore`].
+    ///
+    /// [`TokenStore`]: super::codex_login::TokenStore
+    #[cfg(feature = "codex-login")]
+    pub fn from_token_store(
+        store: super::codex_login::TokenStore,
+        model: impl Into<String>,
+    ) -> Result<Self, LlmError> {
+        let tokens = store
+            .load()
+            .map_err(|e| LlmError(format!("{PROVIDER}: {e}")))?
+            .ok_or_else(|| {
+                LlmError(format!(
+                    "{PROVIDER}: not logged in ({} has no Codex login); run `worldfn login codex`",
+                    store.path().display()
+                ))
+            })?;
+        let login = login::LoginSource::new(store, tokens);
+        Ok(Self::with_source(Source::Login(login), model.into()))
+    }
+
+    /// OAuth server used to refresh a [`from_login`](Self::from_login)
+    /// token. Only for tests against a mock issuer.
+    #[cfg(feature = "codex-login")]
+    pub fn oauth_endpoints(mut self, endpoints: super::codex_login::OAuthEndpoints) -> Self {
+        if let Source::Login(login) = &mut self.source {
+            login.endpoints = endpoints;
+        }
+        self
+    }
+
+    fn with_source(source: Source, model: String) -> Self {
+        Self {
             http: http_client(),
-            auth_file,
+            source,
             endpoint: codex_endpoint(DEFAULT_BASE_URL),
-            model: model.into(),
+            model,
             instructions: DEFAULT_INSTRUCTIONS.into(),
             reasoning_effort: None,
             native_json: false,
-        })
+        }
     }
 
     /// System instructions sent with every request.
@@ -214,6 +264,82 @@ fn encode_message(message: &Message, out: &mut Vec<Value>) {
     }
 }
 
+enum Source {
+    /// The official Codex CLI's `auth.json`, re-read on every call.
+    CodexCli(PathBuf),
+    /// worldfn's own login, refreshed as needed.
+    #[cfg(feature = "codex-login")]
+    Login(login::LoginSource),
+}
+
+impl Source {
+    async fn credentials(&self) -> Result<CodexCredentials, LlmError> {
+        match self {
+            Source::CodexCli(path) => CodexCredentials::load(path),
+            #[cfg(feature = "codex-login")]
+            Source::Login(login) => login.credentials().await,
+        }
+    }
+
+    fn relogin_hint(&self) -> &'static str {
+        match self {
+            Source::CodexCli(_) => "login rejected; run `codex login` again",
+            #[cfg(feature = "codex-login")]
+            Source::Login(_) => "login rejected; run `worldfn login codex` again",
+        }
+    }
+}
+
+#[cfg(feature = "codex-login")]
+mod login {
+    use super::super::codex_login::{self, CodexTokens, OAuthEndpoints, TokenStore};
+    use super::{CodexCredentials, PROVIDER};
+    use crate::LlmError;
+
+    /// Refresh when the token has less than this many seconds left.
+    const REFRESH_MARGIN_SECS: u64 = 5 * 60;
+
+    pub(super) struct LoginSource {
+        store: TokenStore,
+        pub(super) endpoints: OAuthEndpoints,
+        /// Held across a refresh, so concurrent calls refresh once: refresh
+        /// tokens may be single-use.
+        cached: tokio::sync::Mutex<CodexTokens>,
+    }
+
+    impl LoginSource {
+        pub(super) fn new(store: TokenStore, tokens: CodexTokens) -> Self {
+            Self {
+                store,
+                endpoints: OAuthEndpoints::openai(),
+                cached: tokio::sync::Mutex::new(tokens),
+            }
+        }
+
+        pub(super) async fn credentials(&self) -> Result<CodexCredentials, LlmError> {
+            let fail = |e: codex_login::LoginError| LlmError(format!("{PROVIDER}: {e}"));
+            let mut tokens = self.cached.lock().await;
+            if tokens.expires_within(REFRESH_MARGIN_SECS) {
+                // Another process may already have refreshed and saved.
+                if let Some(saved) = self.store.load().map_err(fail)? {
+                    *tokens = saved;
+                }
+            }
+            if tokens.expires_within(REFRESH_MARGIN_SECS) {
+                let fresh = codex_login::refresh(&self.endpoints, &tokens)
+                    .await
+                    .map_err(fail)?;
+                self.store.save(&fresh).map_err(fail)?;
+                *tokens = fresh;
+            }
+            Ok(CodexCredentials {
+                access_token: tokens.access_token.clone(),
+                account_id: tokens.account_id.clone(),
+            })
+        }
+    }
+}
+
 fn codex_endpoint(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
     if base.ends_with("/codex/responses") {
@@ -312,13 +438,13 @@ impl CodexCredentials {
     }
 }
 
-fn jwt_claims(token: &str) -> Option<Value> {
+pub(super) fn jwt_claims(token: &str) -> Option<Value> {
     let payload = token.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-fn now_unix() -> u64 {
+pub(super) fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -495,7 +621,7 @@ impl LlmProvider for CodexLlm {
         let body = self.request_body(&request);
         Box::pin(async move {
             let body = body?;
-            let credentials = CodexCredentials::load(&self.auth_file)?;
+            let credentials = self.source.credentials().await?;
             let response = self
                 .http
                 .post(&self.endpoint)
@@ -509,8 +635,9 @@ impl LlmProvider for CodexLlm {
                 .send()
                 .await
                 .map_err(|e| transport_error(PROVIDER, e))?;
+            let relogin = self.source.relogin_hint();
             let mut response = error_for_status(PROVIDER, response, |status| match status {
-                401 | 403 => Some("login rejected; run `codex login` again"),
+                401 | 403 => Some(relogin),
                 429 => Some("rate or usage limit reached for this ChatGPT plan"),
                 _ => None,
             })

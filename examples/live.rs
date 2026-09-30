@@ -1,11 +1,11 @@
 //! Run a worldfn agent against a real model.
 //!
 //! ```sh
-//! # ChatGPT subscription via the official Codex CLI login (unofficial use,
-//! # see docs/providers.md):
-//! codex login
+//! # ChatGPT subscription (unofficial use, see docs/providers.md). Sign in once:
+//! cargo run --features codex-login --bin worldfn -- login codex
 //! WORLDFN_PROVIDER=codex WORLDFN_MODEL=gpt-5.5 \
-//!   cargo run --example live --features codex -- "What should I name my Rust crate?"
+//!   cargo run --example live --features codex-login -- "What should I name my Rust crate?"
+//! # (or reuse an official `codex login` with --features codex)
 //!
 //! # DeepSeek with an API key:
 //! DEEPSEEK_API_KEY=sk-... WORLDFN_PROVIDER=deepseek WORLDFN_MODEL=deepseek-v4-flash \

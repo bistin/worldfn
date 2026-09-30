@@ -1,9 +1,9 @@
 use serde_json::{Value, json};
 
-use super::{error_for_status, http_client, transport_error};
+use super::{DeltaForwarder, error_for_status, http_client, read_sse, transport_error};
 use crate::chat::{
-    ChatRequest, ChatResponse, FinishReason, Message, MessageRole, OutputFormat, Part, ToolCall,
-    Usage, json_instruction,
+    ChatDelta, ChatRequest, ChatResponse, FinishReason, Message, MessageRole, OutputFormat, Part,
+    ToolCall, Usage, json_instruction,
 };
 use crate::{BoxFuture, LlmError, LlmProvider};
 
@@ -267,24 +267,29 @@ pub(crate) fn parse_response(provider: &str, body: &Value) -> Result<ChatRespons
     })
 }
 
+impl OpenAiCompatLlm {
+    async fn send(&self, body: &Value) -> Result<reqwest::Response, LlmError> {
+        let response = self
+            .http
+            .post(&self.endpoint)
+            .bearer_auth(&self.api_key)
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| transport_error(self.name, e))?;
+        error_for_status(self.name, response, |status| {
+            (status == 401).then_some("check the API key")
+        })
+        .await
+    }
+}
+
 impl LlmProvider for OpenAiCompatLlm {
     fn chat(&self, request: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, LlmError>> {
         let body = self.request_body(&request);
         Box::pin(async move {
-            let body = body?;
-            let response = self
-                .http
-                .post(&self.endpoint)
-                .bearer_auth(&self.api_key)
-                .header("content-type", "application/json")
-                .body(body.to_string())
-                .send()
-                .await
-                .map_err(|e| transport_error(self.name, e))?;
-            let response = error_for_status(self.name, response, |status| {
-                (status == 401).then_some("check the API key")
-            })
-            .await?;
+            let response = self.send(&body?).await?;
             let text = response
                 .text()
                 .await
@@ -293,5 +298,130 @@ impl LlmProvider for OpenAiCompatLlm {
                 .map_err(|e| LlmError(format!("{}: invalid JSON response: {e}", self.name)))?;
             parse_response(self.name, &json)
         })
+    }
+
+    /// Sends `stream: true` with `stream_options.include_usage`, and rebuilds
+    /// the same response `chat` would return from the chunks.
+    fn chat_streaming<'a>(
+        &'a self,
+        request: ChatRequest,
+        on_delta: &'a mut (dyn FnMut(ChatDelta) + Send),
+    ) -> BoxFuture<'a, Result<ChatResponse, LlmError>> {
+        let body = self.request_body(&request).map(|mut body| {
+            body["stream"] = json!(true);
+            body["stream_options"] = json!({ "include_usage": true });
+            body
+        });
+        Box::pin(async move {
+            let response = self.send(&body?).await?;
+            let mut stream = ChunkStream::default();
+            let mut forward = DeltaForwarder::new(Some(on_delta));
+            read_sse(self.name, response, |data| {
+                let done = stream.handle_data(self.name, data)?;
+                forward.forward(&stream.text);
+                Ok(done)
+            })
+            .await?;
+            if stream.finish_reason.is_none() && !stream.done {
+                return Err(LlmError(format!(
+                    "{}: stream ended before the response completed",
+                    self.name
+                )));
+            }
+            parse_response(self.name, &stream.into_body())
+        })
+    }
+}
+
+/// Accumulates `chat.completion.chunk` events into a non-streaming body.
+#[derive(Default)]
+struct ChunkStream {
+    text: String,
+    /// `(id, name, arguments)` by the chunk's `index`.
+    calls: Vec<(String, String, String)>,
+    finish_reason: Option<String>,
+    usage: Option<Value>,
+    done: bool,
+}
+
+impl ChunkStream {
+    fn handle_data(&mut self, provider: &str, data: &str) -> Result<bool, LlmError> {
+        let data = data.trim();
+        if data == "[DONE]" {
+            self.done = true;
+            return Ok(true);
+        }
+        if data.is_empty() {
+            return Ok(false);
+        }
+        let chunk: Value = serde_json::from_str(data)
+            .map_err(|e| LlmError(format!("{provider}: malformed stream chunk: {e}: {data}")))?;
+        if let Some(error) = chunk.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .map_or_else(|| error.to_string(), str::to_owned);
+            return Err(LlmError(format!("{provider}: {message}")));
+        }
+        if let Some(usage) = chunk.get("usage").filter(|u| !u.is_null()) {
+            self.usage = Some(usage.clone());
+        }
+        let Some(choice) = chunk.pointer("/choices/0") else {
+            return Ok(false);
+        };
+        if let Some(text) = choice.pointer("/delta/content").and_then(Value::as_str) {
+            self.text.push_str(text);
+        }
+        for call in choice
+            .pointer("/delta/tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let index = call
+                .get("index")
+                .and_then(Value::as_u64)
+                .map_or(self.calls.len().saturating_sub(1), |i| i as usize);
+            if self.calls.len() <= index {
+                self.calls.resize_with(index + 1, Default::default);
+            }
+            let (id, name, arguments) = &mut self.calls[index];
+            let text = |pointer: &str| call.pointer(pointer).and_then(Value::as_str);
+            if let Some(v) = text("/id") {
+                *id = v.to_owned();
+            }
+            if let Some(v) = text("/function/name") {
+                name.push_str(v);
+            }
+            if let Some(v) = text("/function/arguments") {
+                arguments.push_str(v);
+            }
+        }
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            self.finish_reason = Some(reason.to_owned());
+        }
+        Ok(false)
+    }
+
+    fn into_body(self) -> Value {
+        let calls: Vec<Value> = self
+            .calls
+            .into_iter()
+            .map(|(id, name, arguments)| {
+                json!({ "id": id, "type": "function",
+                        "function": { "name": name, "arguments": arguments } })
+            })
+            .collect();
+        let mut message = json!({ "role": "assistant", "content": self.text });
+        if !calls.is_empty() {
+            message["tool_calls"] = json!(calls);
+        }
+        let mut body = json!({
+            "choices": [{ "message": message, "finish_reason": self.finish_reason }],
+        });
+        if let Some(usage) = self.usage {
+            body["usage"] = usage;
+        }
+        body
     }
 }

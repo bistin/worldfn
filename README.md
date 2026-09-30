@@ -241,7 +241,7 @@ it takes traffic.
 | `triage` | Support-ticket triage: typed `enum` output, retrieval of similar past tickets, malformed model output as a domain error, concurrent runs of one prepared agent. `cargo test --example triage` tests the same agent with fakes. | nothing (fake LLM); optionally a real provider |
 | `live` | A small assistant against a real model | a provider feature and credentials |
 | `mentor_tools` | Tool calling: the model calls `growth_rate`, code computes the number, the model explains it | nothing (scripted fake); optionally a real provider |
-| `worldfn-axum` `chat_server` | Chat page: question in, progress + answer streamed over SSE; skills; per-session history and per-account memory ("remember …") | nothing (fake LLM); optionally a real provider |
+| `worldfn-axum` `chat_server` | Chat page: question in, progress and the answer (as it is generated) streamed over SSE; skills; per-session history and per-account memory ("remember …") | nothing (fake LLM); optionally a real provider |
 
 Examples that accept a real model read `WORLDFN_PROVIDER` / `WORLDFN_MODEL`
 (see below) and otherwise fall back to a fake.
@@ -290,7 +290,7 @@ Setup, caveats, and the Codex terms risk are in
   sequentially. No benchmarks have been run yet.
 - **There is one `Llm` per world.** Several models would need marker-typed
   handles such as `Llm<Fast>`.
-- **Providers are minimal.** One prompt in, text out. There are no tool calls, chat histories, retries, or streaming to the agent.
+- **Providers are minimal.** Two providers (Codex, OpenAI-compatible), no retries or backoff, no images.
 - **No capability enforcement, graphs, or scheduler.**
 
 Details: [`DESIGN.md`](DESIGN.md). Background and roadmap:

@@ -35,7 +35,15 @@ async fn assistant(
             .join("\n"),
         task.0
     );
-    llm.complete(prompt).await
+    // Print the reply as it is generated.
+    let answer = llm
+        .complete_streaming(prompt, |text| {
+            print!("{text}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        })
+        .await?;
+    println!();
+    Ok(answer)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -68,9 +76,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ]))?;
 
     println!("{}\n", assistant.into_agent().meta());
-    let answer = world
+    world
         .run_with(assistant, Scope::of(Task::new(task)))
         .await??;
-    println!("{answer}");
     Ok(())
 }

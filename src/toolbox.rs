@@ -23,7 +23,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::chat::{
-    ChatRequest, ChatResponse, Message, ToolCall, ToolDefinition, ToolResult, Usage,
+    ChatDelta, ChatRequest, ChatResponse, Message, ToolCall, ToolDefinition, ToolResult, Usage,
 };
 use crate::{
     AgentParam, AgentWorld, BoxFuture, Llm, LlmError, ParamError, Requirement, Scope, Tool,
@@ -233,7 +233,11 @@ impl<S: ToolSet> AgentParam for Toolbox<S> {
 
 /// Something that happened inside [`Toolbox::run`], for progress events.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum LoopEvent<'a> {
+    /// Reply text as the model generates it, from any step. Text that comes
+    /// before a tool call ("let me check…") is included.
+    Text(&'a str),
     /// The model asked for a tool; it is about to run.
     ToolCall(&'a ToolCall),
     /// A tool finished (or was refused).
@@ -315,14 +319,15 @@ impl<S: ToolSet> Toolbox<S> {
 
     /// Call the model with these tools, run what it asks for, and repeat
     /// until it answers without tool calls, at most `max_steps` model calls.
-    /// Calls within one model turn run in order. `observe` sees each call and
-    /// result as it happens (e.g. to forward them through an `Emit`).
+    /// Calls within one model turn run in order. `observe` sees streamed reply
+    /// text and each call and result as they happen (e.g. to forward them
+    /// through an `Emit`).
     pub async fn run(
         &self,
         llm: &Llm,
         request: ChatRequest,
         max_steps: usize,
-        mut observe: impl FnMut(LoopEvent<'_>),
+        mut observe: impl FnMut(LoopEvent<'_>) + Send,
     ) -> Result<ToolRun, ToolLoopError> {
         let mut request = request;
         for definition in self.definitions() {
@@ -333,7 +338,11 @@ impl<S: ToolSet> Toolbox<S> {
         let mut calls = Vec::new();
         let mut usage = Usage::default();
         for step in 1..=max_steps {
-            let response = llm.chat(request.clone()).await?;
+            let response = llm
+                .chat_streaming(request.clone(), |delta| match delta {
+                    ChatDelta::Text(text) => observe(LoopEvent::Text(&text)),
+                })
+                .await?;
             if let Some(u) = response.usage {
                 usage.input_tokens += u.input_tokens;
                 usage.output_tokens += u.output_tokens;

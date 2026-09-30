@@ -55,10 +55,16 @@ async fn mentor(
             |event| match event {
                 LoopEvent::ToolCall(call) => println!("  → {}({})", call.name, call.arguments),
                 LoopEvent::ToolResult(_, result) => println!("  ← {}", result.content),
+                // The answer, printed as it is generated.
+                LoopEvent::Text(text) => {
+                    print!("{text}");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+                _ => {}
             },
         )
         .await?;
-    println!("  ({} model call(s))", run.steps);
+    println!("\n\n  ({} model call(s))", run.steps);
     Ok(run.response.message.text())
 }
 
@@ -118,10 +124,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }))?;
 
     println!("{}\n", mentor.into_agent().meta());
-    println!("Q: {question}");
-    let answer = world
+    println!("Q: {question}\n");
+    world
         .run_with(mentor, Scope::of(Task::new(question)))
         .await??;
-    println!("\nA: {answer}");
     Ok(())
 }

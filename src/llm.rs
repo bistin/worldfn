@@ -3,7 +3,7 @@ use std::fmt;
 use std::future::{Ready, ready};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::chat::{ChatRequest, ChatResponse};
+use crate::chat::{ChatDelta, ChatRequest, ChatResponse};
 use crate::param::unmet;
 use crate::{AgentParam, AgentWorld, BoxFuture, ParamError, Requirement, Scope};
 
@@ -26,6 +26,26 @@ impl std::error::Error for LlmError {}
 /// that `Llm` in a signature does not name a backend.
 pub trait LlmProvider: Send + Sync + 'static {
     fn chat(&self, request: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, LlmError>>;
+
+    /// Like [`chat`](Self::chat), but hands reply text to `on_delta` as it is
+    /// generated. The returned response is the same as `chat` would return.
+    ///
+    /// The default calls `chat` and delivers the whole text as one delta, so
+    /// providers that cannot stream still work everywhere streaming is used.
+    fn chat_streaming<'a>(
+        &'a self,
+        request: ChatRequest,
+        on_delta: &'a mut (dyn FnMut(ChatDelta) + Send),
+    ) -> BoxFuture<'a, Result<ChatResponse, LlmError>> {
+        Box::pin(async move {
+            let response = self.chat(request).await?;
+            let text = response.message.text();
+            if !text.is_empty() {
+                on_delta(ChatDelta::Text(text));
+            }
+            Ok(response)
+        })
+    }
 }
 
 /// Parameter: the world's LLM, behind a type-erased provider.
@@ -49,6 +69,32 @@ impl Llm {
     /// One user message in, the reply's text out.
     pub async fn complete(&self, prompt: impl Into<String>) -> Result<String, LlmError> {
         Ok(self.chat(ChatRequest::prompt(prompt)).await?.message.text())
+    }
+
+    /// [`chat`](Self::chat), with reply text passed to `on_delta` while it is
+    /// generated, e.g. to forward it through an [`Emit`](crate::Emit). The
+    /// full response is still returned at the end.
+    pub async fn chat_streaming(
+        &self,
+        request: ChatRequest,
+        mut on_delta: impl FnMut(ChatDelta) + Send,
+    ) -> Result<ChatResponse, LlmError> {
+        self.provider.chat_streaming(request, &mut on_delta).await
+    }
+
+    /// [`complete`](Self::complete), with each piece of text passed to
+    /// `on_text` as it arrives.
+    pub async fn complete_streaming(
+        &self,
+        prompt: impl Into<String>,
+        mut on_text: impl FnMut(&str) + Send,
+    ) -> Result<String, LlmError> {
+        let response = self
+            .chat_streaming(ChatRequest::prompt(prompt), |delta| match delta {
+                ChatDelta::Text(text) => on_text(&text),
+            })
+            .await?;
+        Ok(response.message.text())
     }
 }
 
@@ -183,5 +229,23 @@ impl LlmProvider for FakeLlm {
         };
         state.requests.push(request);
         Box::pin(std::future::ready(reply))
+    }
+
+    /// Streams the scripted text word by word (splitting after whitespace),
+    /// so streaming code paths see more than one delta.
+    fn chat_streaming<'a>(
+        &'a self,
+        request: ChatRequest,
+        on_delta: &'a mut (dyn FnMut(ChatDelta) + Send),
+    ) -> BoxFuture<'a, Result<ChatResponse, LlmError>> {
+        let reply = self.chat(request);
+        Box::pin(async move {
+            let response = reply.await?;
+            let text = response.message.text();
+            for word in text.split_inclusive(char::is_whitespace) {
+                on_delta(ChatDelta::Text(word.to_owned()));
+            }
+            Ok(response)
+        })
     }
 }

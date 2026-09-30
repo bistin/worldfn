@@ -56,6 +56,56 @@ fn tool_results_are_messages_too() {
 
 // ---- Structured output -----------------------------------------------------
 
+/// A provider that only implements `chat`.
+struct Plain;
+
+impl worldfn::LlmProvider for Plain {
+    fn chat(
+        &self,
+        _request: ChatRequest,
+    ) -> worldfn::BoxFuture<'_, Result<ChatResponse, LlmError>> {
+        Box::pin(async { Ok(ChatResponse::text("all at once")) })
+    }
+}
+
+fn texts(delta: worldfn::ChatDelta, into: &mut Vec<String>) {
+    match delta {
+        worldfn::ChatDelta::Text(text) => into.push(text),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn providers_without_streaming_deliver_one_delta() -> TestResult {
+    let mut seen = Vec::new();
+    let response = Llm::new(Plain)
+        .chat_streaming(ChatRequest::prompt("hi"), |d| texts(d, &mut seen))
+        .await?;
+    assert_eq!(seen, ["all at once"]);
+    assert_eq!(response.message.text(), "all at once");
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_llm_streams_word_by_word() -> TestResult {
+    let fake = FakeLlm::new()
+        .then_answer("typed agents stream")
+        .then_answer("again");
+    let llm = Llm::new(fake.clone());
+    let mut seen = Vec::new();
+    llm.chat_streaming(ChatRequest::prompt("go"), |d| texts(d, &mut seen))
+        .await?;
+    assert_eq!(seen, ["typed ", "agents ", "stream"]);
+
+    let mut pieces = String::new();
+    let text = llm
+        .complete_streaming("again", |t| pieces.push_str(t))
+        .await?;
+    assert_eq!((text.as_str(), pieces.as_str()), ("again", "again"));
+    assert_eq!(fake.prompts(), ["go", "again"]);
+    Ok(())
+}
+
 #[cfg(feature = "structured")]
 mod structured {
     use super::*;

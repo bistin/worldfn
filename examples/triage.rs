@@ -20,8 +20,8 @@
 
 use std::fmt;
 
-use serde_json::Value;
 use worldfn::prelude::*;
+use worldfn::{ChatRequest, StructuredError};
 
 mod common;
 
@@ -31,7 +31,8 @@ pub struct Ticket {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum Category {
     Billing,
     Bug,
@@ -40,17 +41,23 @@ pub enum Category {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum Priority {
     Low,
     Normal,
     Urgent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The typed reply. Its JSON Schema is generated from this type and sent to
+/// the model; the reply is validated by deserializing into it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
 pub struct Triage {
     pub category: Category,
     pub priority: Priority,
+    /// A short first reply to the customer.
     pub reply: String,
 }
 
@@ -105,57 +112,31 @@ pub async fn triage(
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let prompt = format!(
-        "Triage this support ticket.\n\n\
-         Similar past tickets and how they were resolved:\n{examples}\n\n\
-         Ticket #{}:\n{}\n\n\
-         Reply with only a JSON object: \
-         {{\"category\": one of \"billing\"|\"bug\"|\"account\"|\"feature_request\"|\"other\", \
-         \"priority\": one of \"low\"|\"normal\"|\"urgent\", \
-         \"reply\": a short first reply to the customer}}",
-        ticket.id, ticket.text
-    );
-    let raw = llm.complete(prompt).await.map_err(TriageError::Llm)?;
-    parse_triage(&raw)
-}
-
-fn parse_triage(raw: &str) -> Result<Triage, TriageError> {
-    let bad = |reason: &str| TriageError::BadModelOutput {
-        reason: reason.to_owned(),
-        raw: raw.to_owned(),
-    };
-    // Models often wrap JSON in a ```json fence; accept that, nothing looser.
-    let json = raw
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-    let value: Value = serde_json::from_str(json).map_err(|_| bad("not a JSON object"))?;
-    let field = |name: &str| value.get(name).and_then(Value::as_str);
-    let category = match field("category") {
-        Some("billing") => Category::Billing,
-        Some("bug") => Category::Bug,
-        Some("account") => Category::Account,
-        Some("feature_request") => Category::FeatureRequest,
-        Some("other") => Category::Other,
-        _ => return Err(bad("missing or unknown category")),
-    };
-    let priority = match field("priority") {
-        Some("low") => Priority::Low,
-        Some("normal") => Priority::Normal,
-        Some("urgent") => Priority::Urgent,
-        _ => return Err(bad("missing or unknown priority")),
-    };
-    let reply = field("reply")
-        .filter(|r| !r.trim().is_empty())
-        .ok_or_else(|| bad("missing reply"))?
-        .to_owned();
-    Ok(Triage {
-        category,
-        priority,
-        reply,
-    })
+    let request = ChatRequest::new()
+        .system("You triage customer support tickets.")
+        .user(format!(
+            "Similar past tickets and how they were resolved:\n{examples}\n\n\
+             Ticket #{}:\n{}",
+            ticket.id, ticket.text
+        ));
+    // One corrective retry if the reply does not fit `Triage`.
+    let triage: Triage = llm
+        .complete_as_retrying(request, 1)
+        .await
+        .map_err(|e| match e {
+            StructuredError::Llm(e) => TriageError::Llm(e),
+            StructuredError::Invalid { reason, raw, .. } => {
+                TriageError::BadModelOutput { reason, raw }
+            }
+        })?;
+    // Rules the type cannot express are still checked in code.
+    if triage.reply.trim().is_empty() {
+        return Err(TriageError::BadModelOutput {
+            reason: "empty reply".into(),
+            raw: String::new(),
+        });
+    }
+    Ok(triage)
 }
 
 fn history() -> FakeMemory {
@@ -297,30 +278,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_model_output_is_a_domain_error() {
-        for (answer, reason) in [
-            ("Sure! It's a billing issue.", "not a JSON object"),
-            (
-                "{\"category\":\"refund\",\"priority\":\"low\",\"reply\":\"x\"}",
-                "missing or unknown category",
-            ),
-            (
-                "{\"category\":\"bug\",\"priority\":\"low\",\"reply\":\" \"}",
-                "missing reply",
-            ),
-        ] {
-            let result = world(FakeLlm::with_answer(answer))
-                .run_with(triage, ticket("anything"))
-                .await
-                .unwrap();
-            match result {
-                Err(TriageError::BadModelOutput { reason: r, raw }) => {
-                    assert_eq!(r, reason);
-                    assert_eq!(raw, answer);
-                }
-                other => panic!("expected BadModelOutput for {answer:?}, got {other:?}"),
+    async fn malformed_output_gets_one_correction_then_is_a_domain_error() {
+        // First reply is prose, the correction is well-formed: success.
+        let llm = FakeLlm::new()
+            .then_answer("Sure! It's a billing issue.")
+            .then_answer(r#"{"category":"billing","priority":"low","reply":"On it."}"#);
+        let result = world(llm.clone())
+            .run_with(triage, ticket("charged twice"))
+            .await
+            .unwrap();
+        assert_eq!(result.map(|t| t.category), Ok(Category::Billing));
+        assert_eq!(llm.calls(), 2);
+
+        // Two bad replies: the caller gets the last one and the reason.
+        let last = r#"{"category":"refund","priority":"low","reply":"x"}"#;
+        let result = world(FakeLlm::scripted(["not json", last]))
+            .run_with(triage, ticket("anything"))
+            .await
+            .unwrap();
+        match result {
+            Err(TriageError::BadModelOutput { reason, raw }) => {
+                assert_eq!(raw, last);
+                assert!(reason.contains("unknown variant `refund`"), "{reason}");
             }
+            other => panic!("expected BadModelOutput, got {other:?}"),
         }
+
+        // Well-formed but empty reply: caught by the check after parsing.
+        let result = world(FakeLlm::with_answer(
+            r#"{"category":"bug","priority":"low","reply":" "}"#,
+        ))
+        .run_with(triage, ticket("anything"))
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(TriageError::BadModelOutput { reason, .. }) if reason == "empty reply")
+        );
     }
 
     #[tokio::test]

@@ -19,9 +19,7 @@ pub fn llm_from_env(instructions: &str) -> Result<Option<Llm>, Box<dyn std::erro
     match provider.as_str() {
         #[cfg(feature = "codex")]
         "codex" => {
-            return Ok(Some(Llm::new(
-                worldfn::providers::CodexLlm::from_codex_home(model)?.instructions(instructions),
-            )));
+            return Ok(Some(Llm::new(codex(model)?.instructions(instructions))));
         }
         #[cfg(feature = "openai-compat")]
         "deepseek" => {
@@ -39,7 +37,29 @@ pub fn llm_from_env(instructions: &str) -> Result<Option<Llm>, Box<dyn std::erro
     }
     Err(format!(
         "unknown provider `{provider}`, or its cargo feature is not enabled \
-         (--features codex / --features openai-compat)"
+         (--features codex-login / --features openai-compat)"
     )
     .into())
+}
+
+/// worldfn's own login (`worldfn login codex`) when it exists, otherwise the
+/// official Codex CLI's.
+#[cfg(feature = "codex")]
+fn codex(model: String) -> Result<worldfn::providers::CodexLlm, Box<dyn std::error::Error>> {
+    use worldfn::providers::CodexLlm;
+    #[cfg(feature = "codex-login")]
+    {
+        let store = worldfn::providers::codex_login::TokenStore::default_location()?;
+        if store.load()?.is_some() {
+            return Ok(CodexLlm::from_token_store(store, model)?);
+        }
+    }
+    CodexLlm::from_codex_home(model).map_err(|e| {
+        let hint = if cfg!(feature = "codex-login") {
+            "run `cargo run --features codex-login --bin worldfn -- login codex`"
+        } else {
+            "build with --features codex-login and run `worldfn login codex`, or `codex login`"
+        };
+        format!("{e}\n  hint: {hint}").into()
+    })
 }

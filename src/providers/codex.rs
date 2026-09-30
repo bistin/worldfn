@@ -18,21 +18,29 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 
 use super::{error_for_status, http_client, transport_error};
+use crate::chat::{
+    ChatRequest, ChatResponse, FinishReason, Message, MessageRole, OutputFormat, Part, ToolCall,
+    Usage, json_instruction,
+};
 use crate::{BoxFuture, LlmError, LlmProvider};
 
 const PROVIDER: &str = "codex";
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const DEFAULT_INSTRUCTIONS: &str = "You are a helpful assistant.";
 /// Claim namespace OpenAI uses for ChatGPT account data inside its JWTs.
-const AUTH_CLAIM: &str = "https://api.openai.com/auth";
+pub(super) const AUTH_CLAIM: &str = "https://api.openai.com/auth";
 
-/// An [`LlmProvider`] billed to your ChatGPT plan, using the login saved by
-/// the official Codex CLI. See the module docs for the caveats.
+/// An [`LlmProvider`] billed to your ChatGPT plan. See the module docs for the
+/// caveats.
 ///
-/// Credentials are re-read from disk on every call, so a token refreshed by
-/// the Codex CLI is picked up without restarting. This provider never
-/// refreshes tokens itself: when the saved token expires, run `codex` (or
-/// `codex login`) again.
+/// Two ways to get credentials:
+///
+/// - [`from_login`](Self::from_login) (feature `codex-login`): worldfn's own
+///   login, `worldfn login codex`. The access token is refreshed shortly
+///   before it expires and written back to the token store.
+/// - [`from_codex_home`](Self::from_codex_home): the login saved by the
+///   official Codex CLI. Re-read from disk on every call, so a token the Codex
+///   CLI refreshed is picked up; worldfn never refreshes these itself.
 ///
 /// ```no_run
 /// # use worldfn::{AgentWorld, providers::CodexLlm};
@@ -43,11 +51,12 @@ const AUTH_CLAIM: &str = "https://api.openai.com/auth";
 /// ```
 pub struct CodexLlm {
     http: reqwest::Client,
-    auth_file: PathBuf,
+    source: Source,
     endpoint: String,
     model: String,
     instructions: String,
     reasoning_effort: Option<String>,
+    native_json: bool,
 }
 
 impl CodexLlm {
@@ -64,14 +73,61 @@ impl CodexLlm {
     ) -> Result<Self, LlmError> {
         let auth_file = path.into();
         CodexCredentials::load(&auth_file)?;
-        Ok(Self {
+        Ok(Self::with_source(Source::CodexCli(auth_file), model.into()))
+    }
+
+    /// Use worldfn's own login from the default [`TokenStore`] location
+    /// (`~/.worldfn/auth.json`). Run `worldfn login codex` first.
+    ///
+    /// [`TokenStore`]: super::codex_login::TokenStore
+    #[cfg(feature = "codex-login")]
+    pub fn from_login(model: impl Into<String>) -> Result<Self, LlmError> {
+        let store = super::codex_login::TokenStore::default_location()
+            .map_err(|e| LlmError(format!("{PROVIDER}: {e}")))?;
+        Self::from_token_store(store, model)
+    }
+
+    /// Use worldfn's own login from a specific [`TokenStore`].
+    ///
+    /// [`TokenStore`]: super::codex_login::TokenStore
+    #[cfg(feature = "codex-login")]
+    pub fn from_token_store(
+        store: super::codex_login::TokenStore,
+        model: impl Into<String>,
+    ) -> Result<Self, LlmError> {
+        let tokens = store
+            .load()
+            .map_err(|e| LlmError(format!("{PROVIDER}: {e}")))?
+            .ok_or_else(|| {
+                LlmError(format!(
+                    "{PROVIDER}: not logged in ({} has no Codex login); run `worldfn login codex`",
+                    store.path().display()
+                ))
+            })?;
+        let login = login::LoginSource::new(store, tokens);
+        Ok(Self::with_source(Source::Login(login), model.into()))
+    }
+
+    /// OAuth server used to refresh a [`from_login`](Self::from_login)
+    /// token. Only for tests against a mock issuer.
+    #[cfg(feature = "codex-login")]
+    pub fn oauth_endpoints(mut self, endpoints: super::codex_login::OAuthEndpoints) -> Self {
+        if let Source::Login(login) = &mut self.source {
+            login.endpoints = endpoints;
+        }
+        self
+    }
+
+    fn with_source(source: Source, model: String) -> Self {
+        Self {
             http: http_client(),
-            auth_file,
+            source,
             endpoint: codex_endpoint(DEFAULT_BASE_URL),
-            model: model.into(),
+            model,
             instructions: DEFAULT_INSTRUCTIONS.into(),
             reasoning_effort: None,
-        })
+            native_json: false,
+        }
     }
 
     /// System instructions sent with every request.
@@ -94,22 +150,193 @@ impl CodexLlm {
         self
     }
 
-    pub(crate) fn request_body(&self, prompt: &str) -> Value {
+    /// Request JSON output with the Responses API's native `text.format`
+    /// JSON Schema instead of only instructing the model. Off by default: the
+    /// Codex backend's support for it is not documented for other clients.
+    pub fn native_structured_output(mut self, enabled: bool) -> Self {
+        self.native_json = enabled;
+        self
+    }
+
+    /// Maps a [`ChatRequest`] to a Responses-API body. `max_output_tokens` is
+    /// not sent: the Codex backend's handling of it is undocumented.
+    pub(crate) fn request_body(&self, request: &ChatRequest) -> Result<Value, LlmError> {
+        let mut instructions = request
+            .system
+            .clone()
+            .unwrap_or_else(|| self.instructions.clone());
+        let mut text_format = None;
+        if let OutputFormat::Json { name, schema } = &request.output {
+            instructions = format!("{instructions}\n\n{}", json_instruction(name, schema));
+            if self.native_json {
+                let schema: Value = serde_json::from_str(schema)
+                    .map_err(|e| LlmError(format!("codex: output schema is not JSON: {e}")))?;
+                text_format = Some(json!({
+                    "format": { "type": "json_schema", "name": name, "schema": schema, "strict": false },
+                }));
+            }
+        }
+
+        let mut input = Vec::new();
+        for message in &request.messages {
+            encode_message(message, &mut input);
+        }
         let mut body = json!({
             "model": self.model,
-            "instructions": self.instructions,
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": [{ "type": "input_text", "text": prompt }],
-            }],
+            "instructions": instructions,
+            "input": input,
             "store": false,
             "stream": true,
         });
+        if !request.tools.is_empty() {
+            let tools = request
+                .tools
+                .iter()
+                .map(|t| {
+                    let parameters: Value = serde_json::from_str(&t.parameters).map_err(|e| {
+                        LlmError(format!(
+                            "codex: tool `{}` parameters are not JSON: {e}",
+                            t.name
+                        ))
+                    })?;
+                    Ok(json!({
+                        "type": "function",
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": parameters,
+                        "strict": false,
+                    }))
+                })
+                .collect::<Result<Vec<_>, LlmError>>()?;
+            body["tools"] = Value::Array(tools);
+        }
+        if let Some(text) = text_format {
+            body["text"] = text;
+        }
         if let Some(effort) = &self.reasoning_effort {
             body["reasoning"] = json!({ "effort": effort });
         }
-        body
+        Ok(body)
+    }
+}
+
+fn encode_message(message: &Message, out: &mut Vec<Value>) {
+    match message.role {
+        MessageRole::User => out.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": message.text() }],
+        })),
+        MessageRole::Assistant => {
+            let text = message.text();
+            if !text.is_empty() {
+                out.push(json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": text }],
+                }));
+            }
+            for call in message.tool_calls() {
+                out.push(json!({
+                    "type": "function_call",
+                    "call_id": call.id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                }));
+            }
+        }
+        MessageRole::Tool => {
+            for part in &message.parts {
+                if let Part::ToolResult(result) = part {
+                    let output = if result.is_error {
+                        format!("Error: {}", result.content)
+                    } else {
+                        result.content.clone()
+                    };
+                    out.push(json!({
+                        "type": "function_call_output",
+                        "call_id": result.call_id,
+                        "output": output,
+                    }));
+                }
+            }
+        }
+    }
+}
+
+enum Source {
+    /// The official Codex CLI's `auth.json`, re-read on every call.
+    CodexCli(PathBuf),
+    /// worldfn's own login, refreshed as needed.
+    #[cfg(feature = "codex-login")]
+    Login(login::LoginSource),
+}
+
+impl Source {
+    async fn credentials(&self) -> Result<CodexCredentials, LlmError> {
+        match self {
+            Source::CodexCli(path) => CodexCredentials::load(path),
+            #[cfg(feature = "codex-login")]
+            Source::Login(login) => login.credentials().await,
+        }
+    }
+
+    fn relogin_hint(&self) -> &'static str {
+        match self {
+            Source::CodexCli(_) => "login rejected; run `codex login` again",
+            #[cfg(feature = "codex-login")]
+            Source::Login(_) => "login rejected; run `worldfn login codex` again",
+        }
+    }
+}
+
+#[cfg(feature = "codex-login")]
+mod login {
+    use super::super::codex_login::{self, CodexTokens, OAuthEndpoints, TokenStore};
+    use super::{CodexCredentials, PROVIDER};
+    use crate::LlmError;
+
+    /// Refresh when the token has less than this many seconds left.
+    const REFRESH_MARGIN_SECS: u64 = 5 * 60;
+
+    pub(super) struct LoginSource {
+        store: TokenStore,
+        pub(super) endpoints: OAuthEndpoints,
+        /// Held across a refresh, so concurrent calls refresh once: refresh
+        /// tokens may be single-use.
+        cached: tokio::sync::Mutex<CodexTokens>,
+    }
+
+    impl LoginSource {
+        pub(super) fn new(store: TokenStore, tokens: CodexTokens) -> Self {
+            Self {
+                store,
+                endpoints: OAuthEndpoints::openai(),
+                cached: tokio::sync::Mutex::new(tokens),
+            }
+        }
+
+        pub(super) async fn credentials(&self) -> Result<CodexCredentials, LlmError> {
+            let fail = |e: codex_login::LoginError| LlmError(format!("{PROVIDER}: {e}"));
+            let mut tokens = self.cached.lock().await;
+            if tokens.expires_within(REFRESH_MARGIN_SECS) {
+                // Another process may already have refreshed and saved.
+                if let Some(saved) = self.store.load().map_err(fail)? {
+                    *tokens = saved;
+                }
+            }
+            if tokens.expires_within(REFRESH_MARGIN_SECS) {
+                let fresh = codex_login::refresh(&self.endpoints, &tokens)
+                    .await
+                    .map_err(fail)?;
+                self.store.save(&fresh).map_err(fail)?;
+                *tokens = fresh;
+            }
+            Ok(CodexCredentials {
+                access_token: tokens.access_token.clone(),
+                account_id: tokens.account_id.clone(),
+            })
+        }
     }
 }
 
@@ -211,13 +438,13 @@ impl CodexCredentials {
     }
 }
 
-fn jwt_claims(token: &str) -> Option<Value> {
+pub(super) fn jwt_claims(token: &str) -> Option<Value> {
     let payload = token.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-fn now_unix() -> u64 {
+pub(super) fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -230,6 +457,9 @@ fn now_unix() -> u64 {
 pub(crate) struct CodexStream {
     buffer: String,
     text: String,
+    calls: Vec<ToolCall>,
+    usage: Option<Usage>,
+    truncated: bool,
     done: bool,
 }
 
@@ -282,25 +512,83 @@ impl CodexStream {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown error")
             ))),
-            Some("response.completed" | "response.done" | "response.incomplete") => {
-                if self.text.is_empty() {
-                    self.text = output_text(event.get("response").unwrap_or(&Value::Null));
+            Some("response.output_item.done") => {
+                if let Some(call) = event.get("item").and_then(function_call) {
+                    self.calls.push(call);
                 }
+                Ok(false)
+            }
+            Some(kind @ ("response.completed" | "response.done" | "response.incomplete")) => {
+                let response = event.get("response").unwrap_or(&Value::Null);
+                if self.text.is_empty() {
+                    self.text = output_text(response);
+                }
+                // Some backends only report output items in the final event.
+                if self.calls.is_empty() {
+                    self.calls = response
+                        .get("output")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(function_call)
+                        .collect();
+                }
+                self.usage = response.get("usage").map(|u| Usage {
+                    input_tokens: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+                    output_tokens: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+                });
+                self.truncated = kind == "response.incomplete"
+                    || response
+                        .pointer("/incomplete_details/reason")
+                        .and_then(Value::as_str)
+                        == Some("max_output_tokens");
                 Ok(true)
             }
             _ => Ok(false),
         }
     }
 
-    pub(crate) fn finish(self) -> Result<String, LlmError> {
+    pub(crate) fn finish(self) -> Result<ChatResponse, LlmError> {
         if self.done {
-            Ok(self.text)
+            let finish = if !self.calls.is_empty() {
+                FinishReason::ToolCalls
+            } else if self.truncated {
+                FinishReason::Length
+            } else {
+                FinishReason::Stop
+            };
+            let mut parts = Vec::new();
+            if !self.text.is_empty() {
+                parts.push(Part::Text(self.text));
+            }
+            parts.extend(self.calls.into_iter().map(Part::ToolCall));
+            Ok(ChatResponse {
+                message: Message {
+                    role: MessageRole::Assistant,
+                    parts,
+                },
+                finish,
+                usage: self.usage,
+            })
         } else {
             Err(LlmError(
                 "codex: stream ended before the response completed".into(),
             ))
         }
     }
+}
+
+/// A `function_call` output item as a tool call.
+fn function_call(item: &Value) -> Option<ToolCall> {
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return None;
+    }
+    let field = |key: &str| item.get(key).and_then(Value::as_str).map(str::to_owned);
+    Some(ToolCall {
+        id: field("call_id")?,
+        name: field("name")?,
+        arguments: field("arguments").unwrap_or_else(|| "{}".into()),
+    })
 }
 
 /// Concatenate `output[*].content[*].text` of type `output_text`.
@@ -329,10 +617,11 @@ fn output_text(response: &Value) -> String {
 }
 
 impl LlmProvider for CodexLlm {
-    fn complete(&self, prompt: String) -> BoxFuture<'_, Result<String, LlmError>> {
-        let body = self.request_body(&prompt);
+    fn chat(&self, request: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, LlmError>> {
+        let body = self.request_body(&request);
         Box::pin(async move {
-            let credentials = CodexCredentials::load(&self.auth_file)?;
+            let body = body?;
+            let credentials = self.source.credentials().await?;
             let response = self
                 .http
                 .post(&self.endpoint)
@@ -346,8 +635,9 @@ impl LlmProvider for CodexLlm {
                 .send()
                 .await
                 .map_err(|e| transport_error(PROVIDER, e))?;
+            let relogin = self.source.relogin_hint();
             let mut response = error_for_status(PROVIDER, response, |status| match status {
-                401 | 403 => Some("login rejected; run `codex login` again"),
+                401 | 403 => Some(relogin),
                 429 => Some("rate or usage limit reached for this ChatGPT plan"),
                 _ => None,
             })
@@ -432,7 +722,7 @@ mod tests {
         let (a, b) = events.split_at(40);
         assert!(!stream.feed(a).unwrap());
         assert!(stream.feed(b).unwrap());
-        assert_eq!(stream.finish().unwrap(), "Hello");
+        assert_eq!(stream.finish().unwrap().message.text(), "Hello");
     }
 
     #[test]
@@ -446,7 +736,7 @@ mod tests {
             )
             .unwrap();
         assert!(done);
-        assert_eq!(stream.finish().unwrap(), "Hi");
+        assert_eq!(stream.finish().unwrap().message.text(), "Hi");
 
         let mut stream = CodexStream::default();
         let err = stream

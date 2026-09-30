@@ -22,6 +22,9 @@ impl std::error::Error for ToolError {}
 /// `Tool<WebSearch>` in a signature never changes when the handler does.
 pub trait ToolSpec: Send + Sync + 'static {
     const NAME: &'static str;
+    /// What the tool does and when to use it; shown to models that can call
+    /// it (see `Toolbox`).
+    const DESCRIPTION: &'static str = "";
     type Request: Send + 'static;
     type Response: Send + 'static;
 }
@@ -153,6 +156,7 @@ impl<T: ToolSpec> ToolHandler<T> for FakeTool<T> {
 pub struct WebSearch;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "structured", derive(serde::Serialize))]
 pub struct SearchHit {
     pub title: String,
     pub url: String,
@@ -161,6 +165,7 @@ pub struct SearchHit {
 
 impl ToolSpec for WebSearch {
     const NAME: &'static str = "web_search";
+    const DESCRIPTION: &'static str = "Search the web. Returns titles, URLs and snippets.";
     type Request = String;
     type Response = Vec<SearchHit>;
 }

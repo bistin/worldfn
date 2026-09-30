@@ -145,6 +145,59 @@ Cache keys length-prefix ids so they cannot collide across accounts.
 `store::conformance` holds the shared behavioral tests; backend crates run it
 against their own stores.
 
+## The LLM contract
+
+`LlmProvider` has one method: `chat(ChatRequest) -> ChatResponse`. The types
+live in the core (`worldfn::chat`) and are shaped after what current SDKs
+converge on:
+- a system prompt;
+- messages made of text, tool-call and tool-result parts;
+- tool definitions;
+- an output format;
+- in the reply, a finish reason and token usage.
+
+Owning them, rather than adopting a crate's types, keeps the core free of
+provider dependencies and lets `FakeLlm` script any reply, including tool
+calls, without a network. A broad provider crate (e.g. rig) can still be
+wrapped as one `LlmProvider` adapter later.
+
+JSON payloads (tool arguments, schemas) are JSON *text* in these types. That
+keeps `--no-default-features` dependency-free. The `structured` feature adds
+`Llm::complete_as::<T>()`, which:
+- generates the schema from `T` with `schemars`;
+- sends it as the output format;
+- validates the reply by deserializing into `T`;
+- on failure, shows the model its reply and the error and asks again, up to a
+  retry limit.
+
+A truncated reply (`FinishReason::Length`) is never parsed. Rules a type
+cannot express, such as a non-empty string, stay in the caller's code, as the
+triage example shows.
+
+### Tool calling
+
+`Toolbox<(A, B, ..)>` is a parameter like any other. The tuple is the model's
+whole tool surface: definitions are generated from each `ToolSpec` (name,
+`DESCRIPTION`, and a schema from `Request`), and `dispatch` only reaches
+handlers in the tuple. The model's arguments are untrusted input. They are
+deserialized into `Request` before any handler runs. Bad arguments, handler
+errors, and calls to unlisted tools become error results the model sees, so it
+can recover, and they never become panics or runtime errors.
+
+`Toolbox::run` is the loop: call the model, run the requested tools in order,
+append calls and results, and repeat until the model answers or `max_steps`
+model calls are used (`ToolLoopError::MaxSteps`). It is a method the agent
+calls, with a visible bound, not something the runtime does around the agent
+(§3). An observer callback sees each call and result, which is how progress
+reaches an `Emit` stream. Agents that need other control flow, such as
+approval before a tool runs or parallel calls, use `definitions` and
+`dispatch` themselves.
+
+Tool arguments must be JSON objects, so a non-object `Request` (e.g.
+`String`) is wrapped as `{"input": ...}` and unwrapped on dispatch.
+
+Still missing: token streaming and images.
+
 ## Skills
 
 Agent Skills are progressive disclosure: a catalog (level 1), full

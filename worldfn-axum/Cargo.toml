@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 [features]
 # Forwarded so examples can use real providers.
 codex = ["worldfn/codex"]
+codex-login = ["codex", "worldfn/codex-login"]
 openai-compat = ["worldfn/openai-compat"]
 
 [dependencies]

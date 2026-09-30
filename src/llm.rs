@@ -3,6 +3,7 @@ use std::fmt;
 use std::future::{Ready, ready};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::chat::{ChatRequest, ChatResponse};
 use crate::param::unmet;
 use crate::{AgentParam, AgentWorld, BoxFuture, ParamError, Requirement, Scope};
 
@@ -19,11 +20,12 @@ impl std::error::Error for LlmError {}
 
 /// A language-model backend.
 ///
-/// Returns a [`BoxFuture`] rather than being an `async fn` because providers
-/// are type-erased (`Arc<dyn LlmProvider>`) so that `Llm` in a signature does
-/// not name a backend. This is a documented dynamic-dispatch boundary.
+/// One method: a provider-neutral [`ChatRequest`] in, one assistant
+/// [`ChatResponse`] out. Returns a [`BoxFuture`] rather than being an
+/// `async fn` because providers are type-erased (`Arc<dyn LlmProvider>`) so
+/// that `Llm` in a signature does not name a backend.
 pub trait LlmProvider: Send + Sync + 'static {
-    fn complete(&self, prompt: String) -> BoxFuture<'_, Result<String, LlmError>>;
+    fn chat(&self, request: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, LlmError>>;
 }
 
 /// Parameter: the world's LLM, behind a type-erased provider.
@@ -39,8 +41,14 @@ impl Llm {
         }
     }
 
+    /// Send a full request: system prompt, history, tools, output format.
+    pub async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
+        self.provider.chat(request).await
+    }
+
+    /// One user message in, the reply's text out.
     pub async fn complete(&self, prompt: impl Into<String>) -> Result<String, LlmError> {
-        self.provider.complete(prompt.into()).await
+        Ok(self.chat(ChatRequest::prompt(prompt)).await?.message.text())
     }
 }
 
@@ -61,20 +69,20 @@ impl AgentParam for Llm {
     }
 }
 
-type Responder = Box<dyn Fn(&str) -> String + Send>;
+type Responder = Box<dyn Fn(&ChatRequest) -> ChatResponse + Send>;
 
 #[derive(Default)]
 struct FakeLlmState {
-    script: VecDeque<Result<String, LlmError>>,
+    script: VecDeque<Result<ChatResponse, LlmError>>,
     responder: Option<Responder>,
-    prompts: Vec<String>,
+    requests: Vec<ChatRequest>,
 }
 
 /// A deterministic LLM for tests.
 ///
 /// Replies from its script first, then from an optional responder, and
-/// otherwise fails the call as unexpected. Every prompt is recorded. Clones
-/// share state, so keep a clone after `provide_llm` to assert on it.
+/// otherwise fails the call as unexpected. Every request is recorded in full.
+/// Clones share state, so keep a clone after `provide_llm` to assert on it.
 #[derive(Clone, Default)]
 pub struct FakeLlm {
     state: Arc<Mutex<FakeLlmState>>,
@@ -100,9 +108,14 @@ impl FakeLlm {
         answers.into_iter().fold(Self::new(), Self::then_answer)
     }
 
-    /// Append an answer to the script.
+    /// Append a text answer to the script.
     pub fn then_answer(self, answer: impl Into<String>) -> Self {
-        self.lock().script.push_back(Ok(answer.into()));
+        self.then_response(ChatResponse::text(answer))
+    }
+
+    /// Append any response (e.g. [`ChatResponse::tool_calls`]) to the script.
+    pub fn then_response(self, response: ChatResponse) -> Self {
+        self.lock().script.push_back(Ok(response));
         self
     }
 
@@ -112,25 +125,42 @@ impl FakeLlm {
         self
     }
 
-    /// Once the script is exhausted, compute replies from the prompt.
+    /// Once the script is exhausted, answer with text computed from the last
+    /// user message.
     pub fn responding(f: impl Fn(&str) -> String + Send + 'static) -> Self {
+        Self::responding_to(move |request| {
+            ChatResponse::text(f(&request.last_user_text().unwrap_or_default()))
+        })
+    }
+
+    /// Once the script is exhausted, compute whole responses from requests.
+    pub fn responding_to(f: impl Fn(&ChatRequest) -> ChatResponse + Send + 'static) -> Self {
         let llm = Self::new();
         llm.lock().responder = Some(Box::new(f));
         llm
     }
 
-    /// Echo every prompt back.
+    /// Echo the last user message back.
     pub fn echo() -> Self {
         Self::responding(str::to_owned)
     }
 
-    /// Every prompt received so far, in order.
+    /// Every request received so far, in order.
+    pub fn requests(&self) -> Vec<ChatRequest> {
+        self.lock().requests.clone()
+    }
+
+    /// The last user message of every request, in order.
     pub fn prompts(&self) -> Vec<String> {
-        self.lock().prompts.clone()
+        self.lock()
+            .requests
+            .iter()
+            .map(|r| r.last_user_text().unwrap_or_default())
+            .collect()
     }
 
     pub fn calls(&self) -> usize {
-        self.lock().prompts.len()
+        self.lock().requests.len()
     }
 
     fn lock(&self) -> MutexGuard<'_, FakeLlmState> {
@@ -139,19 +169,19 @@ impl FakeLlm {
 }
 
 impl LlmProvider for FakeLlm {
-    fn complete(&self, prompt: String) -> BoxFuture<'_, Result<String, LlmError>> {
+    fn chat(&self, request: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, LlmError>> {
         let mut state = self.lock();
         let reply = match state.script.pop_front() {
             Some(reply) => reply,
             None => match &state.responder {
-                Some(f) => Ok(f(&prompt)),
+                Some(f) => Ok(f(&request)),
                 None => Err(LlmError(format!(
                     "FakeLlm received an unexpected call #{}",
-                    state.prompts.len() + 1
+                    state.requests.len() + 1
                 ))),
             },
         };
-        state.prompts.push(prompt);
+        state.requests.push(request);
         Box::pin(std::future::ready(reply))
     }
 }

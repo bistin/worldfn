@@ -99,6 +99,60 @@ Bevy mapping:
 | `FunctionSystem` | `FunctionAgent` |
 | `SystemState` | `prepare` |
 
+## Talking to models
+
+`Llm` takes a provider-neutral `ChatRequest` (system prompt, messages of text /
+tool-call / tool-result parts, tool definitions, output format) and returns one
+assistant `ChatResponse` (message, finish reason, token usage). The shapes follow
+what current SDKs converge on (Vercel AI SDK, pi-ai, rig); worldfn owns these
+types so the core has no provider dependency.
+
+```rust
+// Plain text.
+let text = llm.complete("Summarize this").await?;
+
+// Typed reply: the JSON Schema comes from the type, the reply is validated by
+// deserializing into it, and invalid output gets one corrective retry.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct Triage { category: Category, priority: Priority, reply: String }
+
+let triage: Triage = llm
+    .complete_as(ChatRequest::new().system("You triage tickets.").user(ticket_text))
+    .await?;
+```
+
+Typed replies are the `structured` feature (on by default; it adds `serde`,
+`serde_json` and `schemars`). Providers map the request to their wire format,
+including tool definitions, tool calls and results, and native JSON output
+where it exists. See `docs/providers.md`.
+
+### Tool calling
+
+The tools a model may call are part of the signature, and that tuple is the
+model's whole tool surface:
+
+```rust
+async fn analyst(task: Input<Task>, llm: Llm, tools: Toolbox<(GrowthRate, Quote)>)
+    -> Result<ToolRun, ToolLoopError>
+{
+    // An explicit, bounded loop: call the model, run the tools it asks for,
+    // send the results back, until it answers or 4 model calls are used.
+    tools.run(&llm, ChatRequest::new().user(task.0.clone()), 4, |event| { /* progress */ }).await
+}
+```
+
+- Each tool is an ordinary `ToolSpec`. The schema the model sees is generated
+  from `Request`, and `DESCRIPTION` tells it when to use the tool.
+- The model's arguments are deserialized into `Request` before the handler
+  runs.
+- Invalid arguments, tool errors, and calls to tools **outside the tuple** come
+  back to the model as error results. The handler is never reached.
+- Agents that want their own control flow use `tools.definitions()` and
+  `tools.dispatch(&call)` directly.
+
+`cargo run --example mentor_tools` shows numbers computed by a tool and
+explained by the model.
+
 ## Skills
 
 worldfn reads standard [Agent Skills](https://agentskills.io/specification)
@@ -186,6 +240,7 @@ it takes traffic.
 | `researcher` | Requirement tree, ✓/✗ diagnostics, per-task context | nothing |
 | `triage` | Support-ticket triage: typed `enum` output, retrieval of similar past tickets, malformed model output as a domain error, concurrent runs of one prepared agent. `cargo test --example triage` tests the same agent with fakes. | nothing (fake LLM); optionally a real provider |
 | `live` | A small assistant against a real model | a provider feature and credentials |
+| `mentor_tools` | Tool calling: the model calls `growth_rate`, code computes the number, the model explains it | nothing (scripted fake); optionally a real provider |
 | `worldfn-axum` `chat_server` | Chat page: question in, progress + answer streamed over SSE; skills; per-session history and per-account memory ("remember …") | nothing (fake LLM); optionally a real provider |
 
 Examples that accept a real model read `WORLDFN_PROVIDER` / `WORLDFN_MODEL`
@@ -200,10 +255,16 @@ Providers are opt-in cargo features:
 |---|---|
 | `openai-compat` | `OpenAiCompatLlm`: API-key access to DeepSeek, OpenAI, or any compatible server |
 | `codex` | `CodexLlm`: your ChatGPT subscription through the official Codex CLI's saved login. **Unofficial; personal experiments only.** |
+| `codex-login` | Adds worldfn's own ChatGPT login (`worldfn login codex`, browser or device code) with automatic token refresh, so the Codex CLI is not needed. Same caveats. |
 
 ```sh
 WORLDFN_PROVIDER=deepseek WORLDFN_MODEL=deepseek-v4-flash DEEPSEEK_API_KEY=sk-... \
   cargo run --example live --features openai-compat -- "your question"
+
+# ChatGPT plan: sign in once, then use it like any provider
+cargo run --features codex-login --bin worldfn -- login codex   # add --device without a browser
+WORLDFN_PROVIDER=codex WORLDFN_MODEL=gpt-5.5 \
+  cargo run --example live --features codex-login -- "your question"
 ```
 
 Setup, caveats, and the Codex terms risk are in
@@ -245,9 +306,12 @@ cargo clippy --all-targets
 cargo run --example researcher
 ```
 
-MSRV is 1.85 (edition 2024) for the core, which has no dependencies. The
-`codex` / `openai-compat` features add `reqwest` and `serde_json` and are
-tested on stable 1.94. `tokio` is a dev-dependency.
+MSRV is 1.85 (edition 2024). The core has no dependencies with
+`--no-default-features`; the default `structured` feature adds serde and
+schemars. The
+`codex` / `openai-compat` features add `reqwest` and `serde_json`
+(`codex-login` also `sha2`, `getrandom`, and `tokio`) and are tested on
+stable 1.94. `tokio` is a dev-dependency.
 
 ```sh
 cargo test --workspace --all-features   # core, providers (mock server), axum adapter

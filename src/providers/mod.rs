@@ -65,3 +65,91 @@ pub(crate) async fn error_for_status(
 pub(crate) fn transport_error(provider: &str, error: reqwest::Error) -> LlmError {
     LlmError(format!("{provider}: request failed: {error}"))
 }
+
+/// Splits a server-sent-event body into its `data` payloads.
+#[derive(Default)]
+pub(crate) struct SseFrames {
+    buffer: String,
+}
+
+impl SseFrames {
+    /// Feed decoded text as it arrives; returns the payloads of the frames it
+    /// completed. `\r` is dropped, so CRLF line endings split across chunks
+    /// are handled.
+    pub(crate) fn push(&mut self, chunk: &str) -> Vec<String> {
+        self.buffer.extend(chunk.chars().filter(|&c| c != '\r'));
+        let mut payloads = Vec::new();
+        while let Some(end) = self.buffer.find("\n\n") {
+            let frame: String = self.buffer.drain(..end + 2).collect();
+            let data: Vec<&str> = frame
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(|d| d.strip_prefix(' ').unwrap_or(d))
+                .collect();
+            if !data.is_empty() {
+                payloads.push(data.join("\n"));
+            }
+        }
+        payloads
+    }
+}
+
+/// Read a server-sent-event response, passing each `data` payload to
+/// `on_data` until it returns `Ok(true)` or the body ends. A final frame
+/// without its closing blank line is still delivered.
+pub(crate) async fn read_sse(
+    provider: &str,
+    mut response: reqwest::Response,
+    mut on_data: impl FnMut(&str) -> Result<bool, LlmError>,
+) -> Result<(), LlmError> {
+    let mut frames = SseFrames::default();
+    let mut pending = Vec::new();
+    while let Some(bytes) = response
+        .chunk()
+        .await
+        .map_err(|e| transport_error(provider, e))?
+    {
+        pending.extend_from_slice(&bytes);
+        // Only decode complete UTF-8; keep a split code point for later.
+        let valid = match std::str::from_utf8(&pending) {
+            Ok(s) => s.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        let text = std::str::from_utf8(&pending[..valid]).expect("validated above");
+        let payloads = frames.push(text);
+        pending.drain(..valid);
+        for data in payloads {
+            if on_data(&data)? {
+                return Ok(());
+            }
+        }
+    }
+    for data in frames.push("\n\n") {
+        if on_data(&data)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Forwards text that `current` gained since the last call, as one delta.
+/// Providers accumulate the reply and call this after each event.
+pub(crate) struct DeltaForwarder<'a> {
+    on_delta: Option<&'a mut (dyn FnMut(crate::ChatDelta) + Send)>,
+    sent: usize,
+}
+
+impl<'a> DeltaForwarder<'a> {
+    pub(crate) fn new(on_delta: Option<&'a mut (dyn FnMut(crate::ChatDelta) + Send)>) -> Self {
+        Self { on_delta, sent: 0 }
+    }
+
+    pub(crate) fn forward(&mut self, current: &str) {
+        if let Some(on_delta) = &mut self.on_delta {
+            if current.len() > self.sent {
+                on_delta(crate::ChatDelta::Text(current[self.sent..].to_owned()));
+                self.sent = current.len();
+            }
+        }
+    }
+}

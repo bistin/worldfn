@@ -294,6 +294,7 @@ async fn non_object_requests_are_wrapped_for_the_model() -> TestResult {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Progress {
+    Text(String),
     Calling(String),
     Done(String, bool),
 }
@@ -317,6 +318,10 @@ async fn loop_events_can_be_streamed_through_emit() -> TestResult {
                     LoopEvent::ToolResult(call, result) => {
                         events.send(Progress::Done(call.name.clone(), result.is_error));
                     }
+                    LoopEvent::Text(text) => {
+                        events.send(Progress::Text(text.to_owned()));
+                    }
+                    _ => {}
                 },
             )
             .await?;
@@ -328,7 +333,7 @@ async fn loop_events_can_be_streamed_through_emit() -> TestResult {
             "growth_rate",
             r#"{"current":2,"previous":1}"#,
         )]))
-        .then_answer("100%");
+        .then_answer("It doubled: 100%");
     let f = fixture(llm);
     let (emitter, mut rx) = worldfn::emit::channel::<Progress>();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -339,12 +344,15 @@ async fn loop_events_can_be_streamed_through_emit() -> TestResult {
     while let Some(event) = rx.recv().await {
         seen.lock().unwrap().push(event);
     }
-    assert_eq!(answer, "100%");
+    assert_eq!(answer, "It doubled: 100%");
     assert_eq!(
         *seen.lock().unwrap(),
         [
             Progress::Calling("growth_rate".into()),
-            Progress::Done("growth_rate".into(), false)
+            Progress::Done("growth_rate".into(), false),
+            Progress::Text("It ".into()),
+            Progress::Text("doubled: ".into()),
+            Progress::Text("100%".into()),
         ]
     );
     Ok(())

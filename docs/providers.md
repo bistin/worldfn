@@ -158,6 +158,16 @@ Replies come back as one assistant message with text and/or tool calls, a
 when the provider reports it. On Codex, tool calls are collected from the
 stream (`response.output_item.done`) and from the final response.
 
+`Llm::chat_streaming` (and `complete_streaming`, and `Toolbox::run` through
+`LoopEvent::Text`) delivers text as it is generated:
+
+| Provider | Streaming |
+|---|---|
+| `CodexLlm` | always streams; each `response.output_text.delta` becomes a delta |
+| `OpenAiCompatLlm` | `chat` sends `stream: false`; `chat_streaming` sends `stream: true` with `stream_options.include_usage` and reassembles text, tool-call fragments, finish reason, and usage |
+| `FakeLlm` | word by word, for tests and demos |
+| any other `LlmProvider` | the default: the whole text as one delta once the reply is complete |
+
 JSON output on OpenAI-compatible servers, since support differs:
 
 | `JsonMode` | Sends | Default for |
@@ -179,7 +189,9 @@ status, the provider's error body, and a hint where one helps.
 ## Current limits
 
 - Tool calls within one model turn run sequentially in `Toolbox::run`.
-- No images, and no token streaming to the agent yet.
+- No images.
+- A local server that rejects `stream_options` fails on `chat_streaming`;
+  plain `chat` still works.
 - No retries or backoff.
 - Tests use a local mock server; they check the exact request each provider
   sends and how it parses replies. They cannot exercise the live services from

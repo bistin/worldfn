@@ -10,7 +10,9 @@
 //!
 //! Routes:
 //! - `GET /`             a tiny HTML page using `EventSource`
-//! - `GET /chat?q=...`   runs the agent, streams `status` / `answer` / `failure` events
+//! - `GET /chat?q=...`   runs the agent, streams `status` / `delta` / `answer` / `failure` events
+//!   (`delta` carries answer text as the model generates it; `answer` is the
+//!   complete text at the end)
 //! - `GET /agents`       the agent's requirement tree, from its signature
 //!
 //! The agent knows nothing about axum: it takes an `Input<Question>` and an
@@ -43,6 +45,8 @@ impl AsQuery for Question {
 #[derive(Debug, Clone)]
 enum ChatEvent {
     Status(String),
+    /// Answer text as it is generated.
+    Delta(String),
     Answer(String),
     Error(String),
 }
@@ -51,6 +55,7 @@ impl SseEvent for ChatEvent {
     fn to_sse(&self) -> SseFrame {
         match self {
             ChatEvent::Status(s) => SseFrame::new("status", s.clone()),
+            ChatEvent::Delta(s) => SseFrame::new("delta", s.clone()),
             ChatEvent::Answer(s) => SseFrame::new("answer", s.clone()),
             ChatEvent::Error(s) => SseFrame::new("failure", s.clone()),
         }
@@ -127,7 +132,11 @@ async fn support_chat(
             .join("\n"),
         question.0
     );
-    let answer = llm.complete(prompt).await?;
+    let answer = llm
+        .complete_streaming(prompt, |text| {
+            events.send(ChatEvent::Delta(text.to_owned()));
+        })
+        .await?;
     log.record_exchange(question.0.clone(), answer.clone())
         .await
         .map_err(store_error)?;
@@ -278,6 +287,7 @@ if (!session) {
 function line(cls, text) {
   const p = document.createElement("p");
   p.className = cls; p.textContent = text; log.append(p);
+  return p;
 }
 document.getElementById("f").onsubmit = (e) => {
   e.preventDefault();
@@ -285,8 +295,17 @@ document.getElementById("f").onsubmit = (e) => {
   if (!q) return;
   line("question", "› " + q);
   const es = new EventSource("/chat?q=" + encodeURIComponent(q) + "&session=" + session);
+  let answer = null;
   es.addEventListener("status", (ev) => line("status", ev.data));
-  es.addEventListener("answer", (ev) => { line("answer", ev.data); es.close(); });
+  // Text arrives piece by piece; append it to one paragraph.
+  es.addEventListener("delta", (ev) => {
+    answer = answer || line("answer", "");
+    answer.textContent += ev.data;
+  });
+  es.addEventListener("answer", (ev) => {
+    (answer || line("answer", "")).textContent = ev.data;
+    es.close();
+  });
   es.addEventListener("failure", (ev) => { line("error", ev.data); es.close(); });
   // The server closes the stream when the agent finishes; without this the
   // browser would reconnect and ask again.

@@ -90,7 +90,7 @@ mod world;
 pub use agent::{
     Agent, AgentFuture, AgentMeta, FunctionAgent, IntoAgent, IsAgent, IsFunctionAgent,
 };
-pub use chat::{ChatRequest, ChatResponse, Message, OutputFormat};
+pub use chat::{ChatDelta, ChatRequest, ChatResponse, Message, OutputFormat};
 pub use context::{Context, ContextError, ContextSource, RelevantMemory};
 pub use emit::{Emit, EventStream, SseEvent, SseFrame};
 pub use error::{BindError, Check, Diagnostics, ParamError, ParamErrorKind, RunError};

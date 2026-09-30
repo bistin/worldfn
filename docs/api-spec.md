@@ -79,13 +79,14 @@ agent 端點一律是 `POST`,回應為 `text/event-stream`。瀏覽器原生的 
 | `run.started` | `{ "run_id": "run_..." }` | 一定是第一個事件 |
 | `status` | `{ "stage": "retrieving", "message": "找到 2 筆相關紀錄" }` | 進度,給 UI 顯示用 |
 | `context` | `{ "strategy": "fundamental-thesis@1.0.0", "skills": ["..."], "recalled": 3, "sources": [...] }` | 這次引用了哪些資料,讓使用者可以查證 |
-| `token` | `{ "delta": "..." }` | 逐字輸出(**v0.2**,目前答案整段放在 `result`) |
-| `tool.call` / `tool.result` | `{ "tool": "growth_rate", ... }` | 程式計算的呼叫與結果(**v0.2**,需要 tool calling) |
+| `token` | `{ "delta": "..." }` | 逐字輸出。runtime 以 `Llm::chat_streaming` / `LoopEvent::Text` 提供 |
+| `tool.call` / `tool.result` | `{ "tool": "growth_rate", ... }` | 程式計算的呼叫與結果。runtime 以 `LoopEvent::ToolCall` / `ToolResult` 提供 |
 | `policy` | `{ "rule": "no_trade_instruction", "action": "redirected" }` | 輸出被 policy 攔下並改為引導 |
 | `result` | 端點各自定義的具型別結果 | 最終結果,只送一次 |
 | `error` | `{ "code": "...", "message": "..." }` | 串流中的錯誤,代碼同第 2 節 |
 | `done` | `{}` | 一定是最後一個事件 |
 
+- `token` 是模型生成當下就送出,**還沒經過 policy 檢查**。需要檢查的端點有兩種做法:(1) 不送 `token`,檢查完才送 `result`;(2) 照送 `token`,若最後被攔下就送 `policy`,前端必須用 `result` 取代已顯示的文字。投資建議類端點預設用 (1)。
 - 連線中斷時 agent 仍會跑完,結果可以用 `GET /v1/runs/{run_id}` 取得。v0.1 不支援 `Last-Event-ID` 續傳。
 - 心跳:伺服器定期送出 SSE 註解行,避免 proxy 因連線閒置而斷線。
 

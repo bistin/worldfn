@@ -410,3 +410,150 @@ async fn codex_maps_the_full_request_and_streamed_tool_calls() -> TestResult {
     assert_eq!(body["text"]["format"]["type"], "json_schema");
     Ok(())
 }
+
+/// Collects streamed text deltas.
+fn collector() -> (
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    impl FnMut(worldfn::ChatDelta) + Send,
+) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    (seen, move |delta| {
+        if let worldfn::ChatDelta::Text(text) = delta {
+            sink.lock().unwrap().push(text);
+        }
+    })
+}
+
+#[tokio::test]
+async fn codex_streams_text_deltas_as_they_arrive() -> TestResult {
+    let events = [
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"typed \"}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"del",
+        "ta\":\"agents ✓\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+    ];
+    let (url, _server) = serve_once(
+        "200 OK",
+        "text/event-stream",
+        events.map(String::from).to_vec(),
+    )
+    .await;
+    let auth = write_auth_json(&scratch_dir("codex-stream"), 3600);
+    let llm = Llm::new(CodexLlm::from_auth_file(&auth, "gpt-test")?.base_url(&url));
+
+    let (seen, on_delta) = collector();
+    let response = llm
+        .chat_streaming(ChatRequest::prompt("hi"), on_delta)
+        .await?;
+    assert_eq!(*seen.lock().unwrap(), ["typed ", "agents ✓"]);
+    assert_eq!(response.message.text(), "typed agents ✓");
+    Ok(())
+}
+
+#[tokio::test]
+async fn codex_streams_final_text_when_the_backend_sends_no_deltas() -> TestResult {
+    let events = [
+        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[\
+                   {\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"whole\"}]}]}}\n\n",
+    ];
+    let (url, _server) = serve_once(
+        "200 OK",
+        "text/event-stream",
+        events.map(String::from).to_vec(),
+    )
+    .await;
+    let auth = write_auth_json(&scratch_dir("codex-stream-final"), 3600);
+    let llm = Llm::new(CodexLlm::from_auth_file(&auth, "gpt-test")?.base_url(&url));
+    let (seen, on_delta) = collector();
+    llm.chat_streaming(ChatRequest::prompt("hi"), on_delta)
+        .await?;
+    assert_eq!(*seen.lock().unwrap(), ["whole"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn openai_compatible_streams_text_and_tool_call_fragments() -> TestResult {
+    let chunk = |delta: Value, finish: Value| {
+        format!(
+            "data: {}\n\n",
+            json!({ "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }] })
+        )
+    };
+    let chunks = vec![
+        chunk(json!({ "role": "assistant", "content": "" }), Value::Null),
+        chunk(json!({ "content": "Let me " }), Value::Null),
+        // CRLF endings, split mid-frame, as some servers send.
+        chunk(json!({ "content": "check." }), Value::Null).replace("\n\n", "\r\n\r\n"),
+        chunk(
+            json!({ "tool_calls": [{ "index": 0, "id": "call_1", "type": "function",
+                    "function": { "name": "quote", "arguments": "{\"instr" } }] }),
+            Value::Null,
+        ),
+        chunk(
+            json!({ "tool_calls": [{ "index": 0, "function": { "arguments": "ument\":\"TWSE:2330\"}" } }] }),
+            Value::Null,
+        ),
+        chunk(json!({}), json!("tool_calls")),
+        format!(
+            "data: {}\n\n",
+            json!({ "choices": [], "usage": { "prompt_tokens": 40, "completion_tokens": 9 } })
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let (url, server) = serve_once("200 OK", "text/event-stream", chunks).await;
+    let llm = Llm::new(OpenAiCompatLlm::new(&url, "sk", "m"));
+
+    let (seen, on_delta) = collector();
+    let response = llm
+        .chat_streaming(ChatRequest::prompt("price of 2330?"), on_delta)
+        .await?;
+    assert_eq!(*seen.lock().unwrap(), ["Let me ", "check."]);
+    assert_eq!(response.finish, FinishReason::ToolCalls);
+    assert_eq!(response.message.text(), "Let me check.");
+    let call = response.message.tool_calls().next().unwrap();
+    assert_eq!(
+        (
+            call.id.as_str(),
+            call.name.as_str(),
+            call.arguments.as_str()
+        ),
+        ("call_1", "quote", r#"{"instrument":"TWSE:2330"}"#)
+    );
+    assert_eq!(response.usage.unwrap().output_tokens, 9);
+
+    let body = server.await?.body;
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["stream_options"]["include_usage"], true);
+    Ok(())
+}
+
+#[tokio::test]
+async fn openai_compatible_stream_errors_and_truncation() -> TestResult {
+    let (url, _server) = serve_once(
+        "200 OK",
+        "text/event-stream",
+        vec!["data: {\"error\":{\"message\":\"Insufficient Balance\"}}\n\n".into()],
+    )
+    .await;
+    let llm = Llm::new(OpenAiCompatLlm::new(&url, "sk", "m"));
+    let err = llm
+        .chat_streaming(ChatRequest::prompt("x"), |_| {})
+        .await
+        .unwrap_err();
+    assert!(err.0.contains("Insufficient Balance"), "{err}");
+
+    let (url, _server) = serve_once(
+        "200 OK",
+        "text/event-stream",
+        vec!["data: {\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n\n".into()],
+    )
+    .await;
+    let llm = Llm::new(OpenAiCompatLlm::new(&url, "sk", "m"));
+    let err = llm
+        .chat_streaming(ChatRequest::prompt("x"), |_| {})
+        .await
+        .unwrap_err();
+    assert!(err.0.contains("ended before"), "{err}");
+    Ok(())
+}

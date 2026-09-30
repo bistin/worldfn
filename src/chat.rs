@@ -176,6 +176,16 @@ impl ChatRequest {
     }
 }
 
+/// A piece of a reply, delivered while the model is still generating it. See
+/// [`Llm::chat_streaming`](crate::Llm::chat_streaming).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ChatDelta {
+    /// More reply text. Concatenating every `Text` delta of one call gives
+    /// the reply's text.
+    Text(String),
+}
+
 /// Why the model stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishReason {

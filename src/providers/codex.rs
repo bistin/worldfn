@@ -17,10 +17,12 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 
-use super::{error_for_status, http_client, transport_error};
+#[cfg(test)]
+use super::SseFrames;
+use super::{DeltaForwarder, error_for_status, http_client, read_sse, transport_error};
 use crate::chat::{
-    ChatRequest, ChatResponse, FinishReason, Message, MessageRole, OutputFormat, Part, ToolCall,
-    Usage, json_instruction,
+    ChatDelta, ChatRequest, ChatResponse, FinishReason, Message, MessageRole, OutputFormat, Part,
+    ToolCall, Usage, json_instruction,
 };
 use crate::{BoxFuture, LlmError, LlmProvider};
 
@@ -455,7 +457,8 @@ pub(super) fn now_unix() -> u64 {
 /// text until a terminal event.
 #[derive(Default)]
 pub(crate) struct CodexStream {
-    buffer: String,
+    #[cfg(test)]
+    frames: SseFrames,
     text: String,
     calls: Vec<ToolCall>,
     usage: Option<Usage>,
@@ -466,27 +469,28 @@ pub(crate) struct CodexStream {
 impl CodexStream {
     /// Feed raw bytes as they arrive. Returns `Ok(true)` once the response is
     /// complete.
+    #[cfg(test)]
     pub(crate) fn feed(&mut self, chunk: &str) -> Result<bool, LlmError> {
-        self.buffer.push_str(&chunk.replace("\r\n", "\n"));
-        while let Some(end) = self.buffer.find("\n\n") {
-            let frame: String = self.buffer.drain(..end + 2).collect();
-            let data: Vec<&str> = frame
-                .lines()
-                .filter_map(|line| line.strip_prefix("data:"))
-                .map(str::trim)
-                .collect();
-            let data = data.join("\n");
-            if data.is_empty() || data == "[DONE]" {
-                continue;
-            }
-            let event: Value = serde_json::from_str(&data)
-                .map_err(|e| LlmError(format!("codex: malformed event: {e}: {data}")))?;
-            if self.handle(&event)? {
-                self.done = true;
+        for data in self.frames.push(chunk) {
+            if self.handle_data(&data)? {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// One event's `data` payload. Returns `Ok(true)` once the response is
+    /// complete.
+    pub(crate) fn handle_data(&mut self, data: &str) -> Result<bool, LlmError> {
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            return Ok(false);
+        }
+        let event: Value = serde_json::from_str(data)
+            .map_err(|e| LlmError(format!("codex: malformed event: {e}: {data}")))?;
+        let done = self.handle(&event)?;
+        self.done |= done;
+        Ok(done)
     }
 
     fn handle(&mut self, event: &Value) -> Result<bool, LlmError> {
@@ -616,8 +620,12 @@ fn output_text(response: &Value) -> String {
     text
 }
 
-impl LlmProvider for CodexLlm {
-    fn chat(&self, request: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, LlmError>> {
+impl CodexLlm {
+    fn call<'a>(
+        &'a self,
+        request: ChatRequest,
+        on_delta: Option<&'a mut (dyn FnMut(ChatDelta) + Send)>,
+    ) -> BoxFuture<'a, Result<ChatResponse, LlmError>> {
         let body = self.request_body(&request);
         Box::pin(async move {
             let body = body?;
@@ -636,7 +644,7 @@ impl LlmProvider for CodexLlm {
                 .await
                 .map_err(|e| transport_error(PROVIDER, e))?;
             let relogin = self.source.relogin_hint();
-            let mut response = error_for_status(PROVIDER, response, |status| match status {
+            let response = error_for_status(PROVIDER, response, |status| match status {
                 401 | 403 => Some(relogin),
                 429 => Some("rate or usage limit reached for this ChatGPT plan"),
                 _ => None,
@@ -644,31 +652,31 @@ impl LlmProvider for CodexLlm {
             .await?;
 
             let mut stream = CodexStream::default();
-            let mut pending = Vec::new();
-            while let Some(bytes) = response
-                .chunk()
-                .await
-                .map_err(|e| transport_error(PROVIDER, e))?
-            {
-                pending.extend_from_slice(&bytes);
-                // Only decode complete UTF-8; keep a split code point for later.
-                let valid = match std::str::from_utf8(&pending) {
-                    Ok(s) => s.len(),
-                    Err(e) => e.valid_up_to(),
-                };
-                let text = std::str::from_utf8(&pending[..valid]).expect("validated above");
-                let done = stream.feed(text)?;
-                pending.drain(..valid);
-                if done {
-                    break;
-                }
-            }
-            if !stream.done {
-                // Treat EOF as the end of a final unterminated frame.
-                stream.feed("\n\n")?;
-            }
+            let mut forward = DeltaForwarder::new(on_delta);
+            read_sse(PROVIDER, response, |data| {
+                let done = stream.handle_data(data)?;
+                // Includes the fallback text of a final event when the
+                // backend sent no deltas.
+                forward.forward(&stream.text);
+                Ok(done)
+            })
+            .await?;
             stream.finish()
         })
+    }
+}
+
+impl LlmProvider for CodexLlm {
+    fn chat(&self, request: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, LlmError>> {
+        self.call(request, None)
+    }
+
+    fn chat_streaming<'a>(
+        &'a self,
+        request: ChatRequest,
+        on_delta: &'a mut (dyn FnMut(ChatDelta) + Send),
+    ) -> BoxFuture<'a, Result<ChatResponse, LlmError>> {
+        self.call(request, Some(on_delta))
     }
 }
 

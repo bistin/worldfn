@@ -188,15 +188,35 @@ can recover, and they never become panics or runtime errors.
 append calls and results, and repeat until the model answers or `max_steps`
 model calls are used (`ToolLoopError::MaxSteps`). It is a method the agent
 calls, with a visible bound, not something the runtime does around the agent
-(§3). An observer callback sees each call and result, which is how progress
-reaches an `Emit` stream. Agents that need other control flow, such as
+(§3). An observer callback sees streamed reply text (`LoopEvent::Text`) and each
+call and result, which is how progress reaches an `Emit` stream. Agents that need other control flow, such as
 approval before a tool runs or parallel calls, use `definitions` and
 `dispatch` themselves.
 
 Tool arguments must be JSON objects, so a non-object `Request` (e.g.
 `String`) is wrapped as `{"input": ...}` and unwrapped on dispatch.
 
-Still missing: token streaming and images.
+### Streaming
+
+`LlmProvider::chat_streaming` takes a `&mut dyn FnMut(ChatDelta)` callback
+and returns the same `ChatResponse` as `chat`. The default implementation
+calls `chat` and delivers the whole text as one delta, so a provider that
+cannot stream still works wherever streaming is used, and callers need no
+second code path. Codex streams the Responses-API deltas. OpenAI-compatible
+servers get `stream: true`, and their chunks, including tool-call argument
+fragments, are rebuilt into the non-streaming response shape and parsed by
+the same code.
+
+A callback rather than a returned `Stream` keeps the core free of a stream
+trait and of an async runtime, matching `Emit`. Getting text to a web client
+is one line: forward each delta to an `Emit<E>`, and the framework adapter
+turns that into SSE. `ChatDelta` is `#[non_exhaustive]`, so reasoning
+summaries or tool-call progress can be added later.
+
+Structured output (`complete_as`) does not stream: partial JSON is not useful
+to show, and the reply is only valid once it parses.
+
+Still missing: images.
 
 ## Skills
 

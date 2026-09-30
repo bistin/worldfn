@@ -297,7 +297,9 @@ async fn openai_compatible_maps_the_full_request_and_reply() -> TestResult {
                 }],
             },
         }],
-        "usage": { "prompt_tokens": 120, "completion_tokens": 18 },
+        "usage": { "prompt_tokens": 120, "completion_tokens": 18,
+                   "prompt_tokens_details": { "cached_tokens": 64 },
+                   "completion_tokens_details": { "reasoning_tokens": 7 } },
     });
     let (url, server) = serve_once("200 OK", "application/json", vec![reply.to_string()]).await;
     let llm = Llm::new(OpenAiCompatLlm::new(&url, "sk", "m").json_mode(JsonMode::Schema));
@@ -314,6 +316,7 @@ async fn openai_compatible_maps_the_full_request_and_reply() -> TestResult {
     );
     let usage = response.usage.unwrap();
     assert_eq!((usage.input_tokens, usage.output_tokens), (120, 18));
+    assert_eq!((usage.cached_input_tokens, usage.reasoning_tokens), (64, 7));
 
     let body = server.await?.body;
     assert_eq!(
@@ -369,7 +372,8 @@ async fn codex_maps_the_full_request_and_streamed_tool_calls() -> TestResult {
         "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\
          \"call_id\":\"call_9\",\"name\":\"quote\",\"arguments\":\"{\\\"instrument\\\":\\\"TWSE:2317\\\"}\"}}\n\n",
         "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\
-         \"usage\":{\"input_tokens\":300,\"output_tokens\":12}}}\n\n",
+         \"usage\":{\"input_tokens\":300,\"input_tokens_details\":{\"cached_tokens\":256},\
+         \"output_tokens\":12,\"output_tokens_details\":{\"reasoning_tokens\":4}}}}\n\n",
     ];
     let (url, server) = serve_once(
         "200 OK",
@@ -387,7 +391,16 @@ async fn codex_maps_the_full_request_and_streamed_tool_calls() -> TestResult {
     let response = llm.chat(tool_round_trip_request()).await?;
     assert_eq!(response.finish, FinishReason::ToolCalls);
     assert_eq!(response.message.tool_calls().next().unwrap().id, "call_9");
-    assert_eq!(response.usage.unwrap().input_tokens, 300);
+    let usage = response.usage.unwrap();
+    assert_eq!(
+        (
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.output_tokens,
+            usage.reasoning_tokens
+        ),
+        (300, 256, 12, 4)
+    );
 
     let body = server.await?.body;
     assert_eq!(
@@ -497,7 +510,9 @@ async fn openai_compatible_streams_text_and_tool_call_fragments() -> TestResult 
         chunk(json!({}), json!("tool_calls")),
         format!(
             "data: {}\n\n",
-            json!({ "choices": [], "usage": { "prompt_tokens": 40, "completion_tokens": 9 } })
+            // DeepSeek's names for cache hits and misses.
+            json!({ "choices": [], "usage": { "prompt_tokens": 40, "completion_tokens": 9,
+                    "prompt_cache_hit_tokens": 32, "prompt_cache_miss_tokens": 8 } })
         ),
         "data: [DONE]\n\n".to_owned(),
     ];
@@ -521,6 +536,7 @@ async fn openai_compatible_streams_text_and_tool_call_fragments() -> TestResult 
         ("call_1", "quote", r#"{"instrument":"TWSE:2330"}"#)
     );
     assert_eq!(response.usage.unwrap().output_tokens, 9);
+    assert_eq!(response.usage.unwrap().cached_input_tokens, 32);
 
     let body = server.await?.body;
     assert_eq!(body["stream"], true);
@@ -555,5 +571,27 @@ async fn openai_compatible_stream_errors_and_truncation() -> TestResult {
         .await
         .unwrap_err();
     assert!(err.0.contains("ended before"), "{err}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cache_keys_are_sent_where_supported() -> TestResult {
+    let sse = vec!["data: {\"type\":\"response.completed\",\"response\":{}}\n\n".to_owned()];
+    let (url, server) = serve_once("200 OK", "text/event-stream", sse).await;
+    let auth = write_auth_json(&scratch_dir("codex-cache"), 3600);
+    let llm = Llm::new(CodexLlm::from_auth_file(&auth, "gpt-test")?.base_url(&url));
+    llm.chat(ChatRequest::prompt("hi").cache_key("session-7"))
+        .await?;
+    assert_eq!(server.await?.body["prompt_cache_key"], "session-7");
+
+    let reply = json!({ "choices": [{ "message": { "content": "ok" }, "finish_reason": "stop" }] });
+    // Generic servers may reject unknown fields: off unless enabled.
+    for (enabled, expected) in [(false, Value::Null), (true, json!("session-7"))] {
+        let (url, server) = serve_once("200 OK", "application/json", vec![reply.to_string()]).await;
+        let llm = Llm::new(OpenAiCompatLlm::new(&url, "sk", "m").send_cache_key(enabled));
+        llm.chat(ChatRequest::prompt("hi").cache_key("session-7"))
+            .await?;
+        assert_eq!(server.await?.body["prompt_cache_key"], expected);
+    }
     Ok(())
 }

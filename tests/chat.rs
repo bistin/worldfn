@@ -106,6 +106,24 @@ async fn fake_llm_streams_word_by_word() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn usage_adds_up_and_prints_cache_hits() {
+    use worldfn::chat::Usage;
+    let first = Usage::new(1000, 50);
+    let second = Usage {
+        cached_input_tokens: 960,
+        reasoning_tokens: 30,
+        ..Usage::new(1200, 80)
+    };
+    let total = first + second;
+    assert_eq!(
+        total.to_string(),
+        "in 2200 (cached 960, 44%) · out 130 (reasoning 30)"
+    );
+    assert_eq!(first.to_string(), "in 1000 · out 50");
+    assert_eq!(Usage::default().cache_hit_rate(), 0.0);
+}
+
 #[cfg(feature = "structured")]
 mod structured {
     use super::*;

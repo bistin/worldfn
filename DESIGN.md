@@ -216,6 +216,36 @@ summaries or tool-call progress can be added later.
 Structured output (`complete_as`) does not stream: partial JSON is not useful
 to show, and the reply is only valid once it parses.
 
+### Prompt caching
+
+Hosted providers (OpenAI, the Codex backend, DeepSeek) and local servers
+(vLLM, llama.cpp) reuse the computed prefix of a prompt they have seen
+recently: cached input is faster and cheaper. worldfn cannot control the
+cache, only keep prompts cache-friendly, so the rules are about ordering:
+
+1. **Stable first, variable last.** System prompt, then history as real
+   messages (`Conversation::messages`), then one final user message with what
+   was retrieved for this question (`Context` output, selected skills, recall)
+   and the question. Retrieved context in the system prompt changes the first
+   tokens and makes every request a miss.
+2. **Append, never rewrite.** `Toolbox::run` only appends calls and results,
+   keeps system prompt and tool definitions identical between steps, and a
+   test checks that each step's request is a prefix of the next. Serialization
+   is deterministic (sorted JSON keys, schemas from the types, tool arguments
+   echoed as the model wrote them).
+3. **One cache key per conversation.** `ChatRequest::cache_key` becomes
+   `prompt_cache_key` on Codex and (opt-in) OpenAI, which routes requests with
+   the same prefix to the same cache. `Toolbox::run` sets one per run if the
+   caller did not; a chat endpoint should use the session id.
+4. **Measure it.** `Usage::cached_input_tokens` (and `reasoning_tokens`) are
+   parsed from each provider's own field names; `LoopEvent::ModelResponded`
+   reports usage per model call.
+
+Known limits: `Conversation<N>` is a sliding window, so past `N` turns its
+oldest message changes each turn and the cached prefix stops at the system
+prompt. Dropping old tool outputs or screenshots to save context has the same
+effect; do it in large, rare steps rather than a little on every call.
+
 Still missing: images.
 
 ## Skills

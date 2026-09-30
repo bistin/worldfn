@@ -10,9 +10,9 @@
 //!
 //! Routes:
 //! - `GET /`             a tiny HTML page using `EventSource`
-//! - `GET /chat?q=...`   runs the agent, streams `status` / `delta` / `answer` / `failure` events
-//!   (`delta` carries answer text as the model generates it; `answer` is the
-//!   complete text at the end)
+//! - `GET /chat?q=...`   runs the agent, streams `status` / `delta` / `answer` /
+//!   `usage` / `failure` events (`delta` carries answer text as the model
+//!   generates it; `answer` is the complete text; `usage` the token counts)
 //! - `GET /agents`       the agent's requirement tree, from its signature
 //!
 //! The agent knows nothing about axum: it takes an `Input<Question>` and an
@@ -27,7 +27,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use worldfn::prelude::*;
 use worldfn::store::{Cached, InMemoryAccountMemory, InMemoryCache, InMemorySessions};
-use worldfn::{AsQuery, LlmError, SseEvent, SseFrame, emit};
+use worldfn::{AsQuery, ChatRequest, LlmError, SseEvent, SseFrame, emit};
 
 #[path = "../../examples/common/mod.rs"]
 mod common;
@@ -48,6 +48,7 @@ enum ChatEvent {
     /// Answer text as it is generated.
     Delta(String),
     Answer(String),
+    Usage(String),
     Error(String),
 }
 
@@ -57,6 +58,7 @@ impl SseEvent for ChatEvent {
             ChatEvent::Status(s) => SseFrame::new("status", s.clone()),
             ChatEvent::Delta(s) => SseFrame::new("delta", s.clone()),
             ChatEvent::Answer(s) => SseFrame::new("answer", s.clone()),
+            ChatEvent::Usage(s) => SseFrame::new("usage", s.clone()),
             ChatEvent::Error(s) => SseFrame::new("failure", s.clone()),
         }
     }
@@ -114,9 +116,12 @@ async fn support_chat(
         )));
     }
     events.send(ChatEvent::Status("asking the model…".into()));
-    let prompt = format!(
-        "{}\n\nWhat you know about this user:\n{}\n\nConversation so far:\n{}\n\n\
-         Answer using only these passages; say so if they are not enough.\n{}\n\nQuestion: {}",
+
+    // Ordered for prompt caching: what rarely changes first (system prompt,
+    // then the session's history as real messages, which only grows), and
+    // what changes on every question last.
+    let turn = format!(
+        "{}\n\nWhat you know about this user:\n{}\n\nPassages:\n{}\n\nQuestion: {}",
         skills.prompt(),
         recall
             .texts()
@@ -124,7 +129,6 @@ async fn support_chat(
             .map(|t| format!("* {t}"))
             .collect::<Vec<_>>()
             .join("\n"),
-        history.transcript(),
         kb.passages
             .iter()
             .map(|p| format!("- {p}"))
@@ -132,17 +136,30 @@ async fn support_chat(
             .join("\n"),
         question.0
     );
-    let answer = llm
-        .complete_streaming(prompt, |text| {
-            events.send(ChatEvent::Delta(text.to_owned()));
+    let mut request = ChatRequest::new()
+        .system(SYSTEM)
+        .cache_key(format!("chat-{}", log.principal().session));
+    request.messages = history.messages();
+    let response = llm
+        .chat_streaming(request.user(turn), |delta| {
+            if let worldfn::ChatDelta::Text(text) = delta {
+                events.send(ChatEvent::Delta(text));
+            }
         })
         .await?;
+    let answer = response.message.text();
+    if let Some(usage) = response.usage {
+        events.send(ChatEvent::Usage(usage.to_string()));
+    }
     log.record_exchange(question.0.clone(), answer.clone())
         .await
         .map_err(store_error)?;
     events.send(ChatEvent::Answer(answer.clone()));
     Ok(answer)
 }
+
+const SYSTEM: &str = "You answer support questions briefly. Answer using only the \
+passages in the latest message, and say so if they are not enough.";
 
 fn store_error(e: worldfn::store::StoreError) -> LlmError {
     LlmError(e.to_string())
@@ -297,6 +314,7 @@ document.getElementById("f").onsubmit = (e) => {
   const es = new EventSource("/chat?q=" + encodeURIComponent(q) + "&session=" + session);
   let answer = null;
   es.addEventListener("status", (ev) => line("status", ev.data));
+  es.addEventListener("usage", (ev) => line("status", "tokens: " + ev.data));
   // Text arrives piece by piece; append it to one paragraph.
   es.addEventListener("delta", (ev) => {
     answer = answer || line("answer", "");
@@ -304,7 +322,6 @@ document.getElementById("f").onsubmit = (e) => {
   });
   es.addEventListener("answer", (ev) => {
     (answer || line("answer", "")).textContent = ev.data;
-    es.close();
   });
   es.addEventListener("failure", (ev) => { line("error", ev.data); es.close(); });
   // The server closes the stream when the agent finishes; without this the

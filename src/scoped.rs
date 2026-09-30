@@ -218,6 +218,11 @@ impl AgentParam for AccountMemory {
 }
 
 /// Context: the last `N` turns of the caller's session, oldest first.
+///
+/// For prompt caching, send these as [`messages`](Self::messages) right after
+/// the system prompt. Once a session is longer than `N` turns the window
+/// slides, so the oldest message changes every turn and the cached prefix
+/// ends at the system prompt.
 #[derive(Debug, Clone)]
 pub struct Conversation<const N: usize> {
     pub turns: Vec<Turn>,
@@ -237,6 +242,17 @@ impl<const N: usize> Conversation<N> {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The turns as chat messages, to append to a request in order.
+    pub fn messages(&self) -> Vec<crate::chat::Message> {
+        self.turns
+            .iter()
+            .map(|t| match t.role {
+                Role::User => crate::chat::Message::user(t.text.clone()),
+                Role::Assistant => crate::chat::Message::assistant(t.text.clone()),
+            })
+            .collect()
     }
 }
 

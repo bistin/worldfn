@@ -123,8 +123,8 @@ async fn model_calls_tools_and_numbers_come_from_code() -> TestResult {
     let llm = FakeLlm::new()
         .then_response(ChatResponse {
             usage: Some(Usage {
-                input_tokens: 100,
-                output_tokens: 10,
+                cached_input_tokens: 0,
+                ..Usage::new(100, 10)
             }),
             ..ChatResponse::tool_calls([
                 call("c1", "growth_rate", r#"{"current":120,"previous":100}"#),
@@ -133,8 +133,9 @@ async fn model_calls_tools_and_numbers_come_from_code() -> TestResult {
         })
         .then_response(ChatResponse {
             usage: Some(Usage {
-                input_tokens: 150,
-                output_tokens: 20,
+                // The second call re-sends the first call's prompt as its prefix.
+                cached_input_tokens: 96,
+                ..Usage::new(150, 20)
             }),
             ..ChatResponse::text("Revenue grew 20%; the delayed quote is 612.")
         });
@@ -153,8 +154,8 @@ async fn model_calls_tools_and_numbers_come_from_code() -> TestResult {
     assert_eq!(
         run.usage,
         Usage {
-            input_tokens: 250,
-            output_tokens: 30
+            cached_input_tokens: 96,
+            ..Usage::new(250, 30)
         }
     );
     assert_eq!(run.calls.len(), 2);
@@ -381,4 +382,78 @@ fn signature_lists_the_tool_surface_and_missing_handlers() {
         "{err}"
     );
     assert!(err.to_string().contains("✓ Tool<quote>"), "{err}");
+}
+
+#[tokio::test]
+async fn every_step_extends_the_previous_prompt_so_it_can_be_cached() -> TestResult {
+    let llm = FakeLlm::new()
+        .then_response(ChatResponse::tool_calls([call(
+            "c1",
+            "growth_rate",
+            r#"{"current":2,"previous":1}"#,
+        )]))
+        .then_response(ChatResponse::tool_calls([call(
+            "c2",
+            "quote",
+            r#"{"instrument":"TWSE:2330"}"#,
+        )]))
+        .then_answer("done");
+    let f = fixture(llm.clone());
+    f.world
+        .run_with(analyst, Scope::of(Task::new("growth and price?")))
+        .await??;
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 3);
+    let key = requests[0]
+        .cache_key
+        .clone()
+        .expect("the loop sets a cache key");
+    for pair in requests.windows(2) {
+        let (before, after) = (&pair[0], &pair[1]);
+        // Same system prompt, tools and key; messages only appended.
+        assert_eq!(before.system, after.system);
+        assert_eq!(before.tools, after.tools);
+        assert_eq!(after.cache_key.as_ref(), Some(&key));
+        assert!(after.messages.len() > before.messages.len());
+        assert_eq!(before.messages[..], after.messages[..before.messages.len()]);
+    }
+
+    // A caller's own key (e.g. the session id) is kept.
+    async fn keyed(llm: Llm, tools: Toolbox<(GrowthRate, Quote)>) -> Result<(), ToolLoopError> {
+        let request = ChatRequest::prompt("hi").cache_key("session-42");
+        tools.run(&llm, request, 1, |_| {}).await?;
+        Ok(())
+    }
+    let llm = FakeLlm::new().then_answer("hi");
+    fixture(llm.clone()).world.run(keyed).await??;
+    assert_eq!(llm.requests()[0].cache_key.as_deref(), Some("session-42"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_loop_reports_usage_per_model_call() -> TestResult {
+    async fn counted(
+        llm: Llm,
+        tools: Toolbox<(GrowthRate, Quote)>,
+    ) -> Result<Vec<(usize, Option<Usage>)>, ToolLoopError> {
+        let mut seen = Vec::new();
+        tools
+            .run(&llm, ChatRequest::prompt("growth?"), 3, |event| {
+                if let LoopEvent::ModelResponded { step, usage } = event {
+                    seen.push((step, usage.copied()));
+                }
+            })
+            .await?;
+        Ok(seen)
+    }
+    let llm = FakeLlm::new()
+        .then_response(ChatResponse {
+            usage: Some(Usage::new(100, 5)),
+            ..ChatResponse::tool_calls([call("c1", "growth_rate", r#"{"current":2,"previous":1}"#)])
+        })
+        .then_answer("100%");
+    let seen = fixture(llm).world.run(counted).await??;
+    assert_eq!(seen, [(1, Some(Usage::new(100, 5))), (2, None)]);
+    Ok(())
 }

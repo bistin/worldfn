@@ -242,6 +242,12 @@ pub enum LoopEvent<'a> {
     ToolCall(&'a ToolCall),
     /// A tool finished (or was refused).
     ToolResult(&'a ToolCall, &'a ToolResult),
+    /// Model call number `step` (from 1) returned. `usage` is `None` when
+    /// the provider did not report it.
+    ModelResponded {
+        step: usize,
+        usage: Option<&'a Usage>,
+    },
 }
 
 /// The outcome of [`Toolbox::run`].
@@ -330,6 +336,11 @@ impl<S: ToolSet> Toolbox<S> {
         mut observe: impl FnMut(LoopEvent<'_>) + Send,
     ) -> Result<ToolRun, ToolLoopError> {
         let mut request = request;
+        // Every step shares one prompt prefix; let the provider route them
+        // to the same cache.
+        if request.cache_key.is_none() {
+            request.cache_key = Some(run_cache_key());
+        }
         for definition in self.definitions() {
             if !request.tools.iter().any(|t| t.name == definition.name) {
                 request.tools.push(definition);
@@ -343,9 +354,12 @@ impl<S: ToolSet> Toolbox<S> {
                     ChatDelta::Text(text) => observe(LoopEvent::Text(&text)),
                 })
                 .await?;
+            observe(LoopEvent::ModelResponded {
+                step,
+                usage: response.usage.as_ref(),
+            });
             if let Some(u) = response.usage {
-                usage.input_tokens += u.input_tokens;
-                usage.output_tokens += u.output_tokens;
+                usage += u;
             }
             let requested: Vec<ToolCall> = response.message.tool_calls().cloned().collect();
             if requested.is_empty() {
@@ -368,4 +382,19 @@ impl<S: ToolSet> Toolbox<S> {
         }
         Err(ToolLoopError::MaxSteps { max_steps, calls })
     }
+}
+
+/// A key unique to this process and run; not a secret.
+fn run_cache_key() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!(
+        "worldfn-{:x}-{:x}-{}",
+        std::process::id(),
+        nanos,
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }

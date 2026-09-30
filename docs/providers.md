@@ -152,10 +152,21 @@ Both providers take the full `ChatRequest`:
 | `tools` | `tools[].function` | `tools[]` (`type: function`) |
 | `OutputFormat::Json` | depends on `JsonMode` (below) | schema in `instructions`; `text.format` too with `.native_structured_output(true)` |
 | `max_output_tokens` | `max_tokens` | not sent (undocumented on the Codex backend) |
+| `cache_key` | `prompt_cache_key` only with `.send_cache_key(true)` (default for `openai()`) | `prompt_cache_key` |
 
 Replies come back as one assistant message with text and/or tool calls, a
 `FinishReason` (`Stop`, `ToolCalls`, `Length`, `ContentFilter`), and usage
-when the provider reports it. On Codex, tool calls are collected from the
+when the provider reports it. `Usage` prints as
+`in 2200 (cached 960, 44%) · out 130 (reasoning 30)`:
+
+| `Usage` field | OpenAI-compatible | Codex (Responses API) |
+|---|---|---|
+| `input_tokens` | `prompt_tokens` | `input_tokens` |
+| `cached_input_tokens` (part of input) | `prompt_tokens_details.cached_tokens`, DeepSeek `prompt_cache_hit_tokens`, or `cached_tokens` | `input_tokens_details.cached_tokens` |
+| `output_tokens` | `completion_tokens` | `output_tokens` |
+| `reasoning_tokens` (part of output) | `completion_tokens_details.reasoning_tokens` | `output_tokens_details.reasoning_tokens` |
+
+See DESIGN.md, "Prompt caching", for how to order prompts so the cache hits. On Codex, tool calls are collected from the
 stream (`response.output_item.done`) and from the final response.
 
 `Llm::chat_streaming` (and `complete_streaming`, and `Toolbox::run` through

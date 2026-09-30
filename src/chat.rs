@@ -119,6 +119,10 @@ pub struct ChatRequest {
     pub tools: Vec<ToolDefinition>,
     pub output: OutputFormat,
     pub max_output_tokens: Option<u32>,
+    /// Groups requests that share a prompt prefix, so a provider can route
+    /// them to where that prefix is already cached (`prompt_cache_key`). Use
+    /// one key per conversation or agent run. Never affects the reply.
+    pub cache_key: Option<String>,
 }
 
 impl ChatRequest {
@@ -166,6 +170,12 @@ impl ChatRequest {
         self
     }
 
+    /// See [`cache_key`](Self::cache_key).
+    pub fn cache_key(mut self, key: impl Into<String>) -> Self {
+        self.cache_key = Some(key.into());
+        self
+    }
+
     /// The text of the last user message, if any.
     pub fn last_user_text(&self) -> Option<String> {
         self.messages
@@ -200,10 +210,74 @@ pub enum FinishReason {
     Other,
 }
 
+/// Tokens a call used, as the provider reported them.
+///
+/// `cached_input_tokens` is the part of `input_tokens` served from the
+/// provider's prompt cache (a prefix it had seen recently); `reasoning_tokens`
+/// is the part of `output_tokens` spent on hidden reasoning. Both are 0 when
+/// the provider does not report them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Usage {
     pub input_tokens: u64,
+    pub cached_input_tokens: u64,
     pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+}
+
+impl Usage {
+    pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            ..Self::default()
+        }
+    }
+
+    /// Fraction of input tokens served from the cache, 0.0 to 1.0.
+    pub fn cache_hit_rate(&self) -> f64 {
+        if self.input_tokens == 0 {
+            0.0
+        } else {
+            self.cached_input_tokens as f64 / self.input_tokens as f64
+        }
+    }
+}
+
+impl std::ops::AddAssign for Usage {
+    fn add_assign(&mut self, other: Self) {
+        self.input_tokens += other.input_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+    }
+}
+
+impl std::ops::Add for Usage {
+    type Output = Self;
+    fn add(mut self, other: Self) -> Self {
+        self += other;
+        self
+    }
+}
+
+/// `in 1200 (cached 1024, 85%) · out 80 (reasoning 32)`
+impl std::fmt::Display for Usage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "in {}", self.input_tokens)?;
+        if self.cached_input_tokens > 0 {
+            write!(
+                f,
+                " (cached {}, {:.0}%)",
+                self.cached_input_tokens,
+                self.cache_hit_rate() * 100.0
+            )?;
+        }
+        write!(f, " · out {}", self.output_tokens)?;
+        if self.reasoning_tokens > 0 {
+            write!(f, " (reasoning {})", self.reasoning_tokens)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -218,7 +218,11 @@ The loop guarantees, with or without options:
 Options add budgets (tool calls per run and per reply, failed calls, the same
 call failing repeatedly), a cap on result size (cut with a note the model
 sees), a time limit, and a `CancelToken`. Every error carries the calls made
-so far (`ToolLoopError::calls`). Deadlines and cancellation use `std` only
+so far (`ToolLoopError::calls`), a failed model call included, and the loop
+never repeats a tool; see `docs/vm-execution.md` for recovery, retry and
+cleanup rules. A reply cut off at the length limit or filtered runs none of
+its tool calls. An `Observer` sees each tool's full result, even when
+`max_result_bytes` cuts the copy the model sees. Deadlines and cancellation use `std` only
 (`worldfn::cancel`), like `Emit`. Stopping abandons the in-flight future at
 its next await point; work outside the process (a remote command) needs its
 own cleanup, which is the adapter's job.

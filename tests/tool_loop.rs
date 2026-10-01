@@ -492,3 +492,68 @@ async fn cancelling_stops_the_run() {
     assert!(matches!(err, ToolLoopError::Stopped { .. }));
     assert_eq!(llm.calls(), 0);
 }
+
+#[tokio::test]
+async fn a_failed_model_call_keeps_the_calls_that_already_ran() {
+    let llm = FakeLlm::new()
+        .then_response(ChatResponse::tool_calls([
+            call("a", "t1", 1),
+            call("b", "t2", 2),
+        ]))
+        .then_error("upstream 503");
+    let w = world(llm);
+    let err = run_nine(&w, ChatRequest::prompt("go"), LoopOptions::new(3))
+        .await
+        .unwrap_err();
+    match &err {
+        ToolLoopError::Llm { error, calls } => {
+            assert!(error.0.contains("503"));
+            let ids: Vec<_> = calls.iter().map(|(c, _)| c.id.as_str()).collect();
+            assert_eq!(ids, ["a", "b"]);
+        }
+        other => panic!("{other}"),
+    }
+    assert!(err.to_string().contains("after 2 tool call(s)"), "{err}");
+}
+
+#[tokio::test]
+async fn calls_in_a_cut_off_or_filtered_reply_never_run() {
+    for finish in [FinishReason::Length, FinishReason::ContentFilter] {
+        let llm = FakeLlm::new().then_response(ChatResponse {
+            finish,
+            ..ChatResponse::tool_calls([call("a", "t1", 1)])
+        });
+        let w = world(llm);
+        let err = run_nine(&w, ChatRequest::prompt("go"), LoopOptions::new(3))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ToolLoopError::Unfinished { calls, .. } if calls.is_empty()),
+            "{finish:?}: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_observer_sees_the_full_result_even_when_the_model_sees_a_cut() -> TestResult {
+    use std::sync::{Arc, Mutex};
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let observer = move |_: &ToolCall, result: &worldfn::chat::ToolResult| {
+        sink.lock().unwrap().push(result.content.clone());
+        Vec::new()
+    };
+    let llm = FakeLlm::new()
+        .then_response(ChatResponse::tool_calls([call("a", "t1", 123_456_789)]))
+        .then_answer("ok");
+    let w = world(llm);
+    let run = run_nine(
+        &w,
+        ChatRequest::prompt("go"),
+        LoopOptions::new(3).max_result_bytes(10).observer(observer),
+    )
+    .await?;
+    assert!(run.calls[0].1.content.contains("[truncated"));
+    assert_eq!(*seen.lock().unwrap(), [r#"{"tool":"t1","n":123456789}"#]);
+    Ok(())
+}

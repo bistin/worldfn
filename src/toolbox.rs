@@ -466,13 +466,20 @@ pub enum LoopLimit {
     RepeatedFailures,
 }
 
-/// Every error but [`Llm`](Self::Llm) and
-/// [`InvalidToolSurface`](Self::InvalidToolSurface) carries the calls made
-/// so far, for a report; see [`calls`](Self::calls).
+/// Every error carries the tool calls completed before it (empty for
+/// [`InvalidToolSurface`](Self::InvalidToolSurface)); see
+/// [`calls`](Self::calls). Those calls had their effects: the loop never
+/// undoes or repeats them, and a caller deciding whether to retry must look
+/// at them first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ToolLoopError {
-    Llm(LlmError),
+    /// A model call failed. Tools that already ran are in `calls`: they are
+    /// not undone, and retrying the whole run would run them again.
+    Llm {
+        error: LlmError,
+        calls: Vec<(ToolCall, ToolResult)>,
+    },
     /// The model was still calling tools after `max_steps` model calls.
     MaxSteps {
         max_steps: usize,
@@ -509,12 +516,13 @@ impl ToolLoopError {
     /// The tool calls completed before the error.
     pub fn calls(&self) -> &[(ToolCall, ToolResult)] {
         match self {
-            ToolLoopError::MaxSteps { calls, .. }
+            ToolLoopError::Llm { calls, .. }
+            | ToolLoopError::MaxSteps { calls, .. }
             | ToolLoopError::Unfinished { calls, .. }
             | ToolLoopError::InvalidTurn { calls, .. }
             | ToolLoopError::LimitExceeded { calls, .. }
             | ToolLoopError::Stopped { calls, .. } => calls,
-            ToolLoopError::Llm(_) | ToolLoopError::InvalidToolSurface(_) => &[],
+            ToolLoopError::InvalidToolSurface(_) => &[],
         }
     }
 }
@@ -523,7 +531,8 @@ impl fmt::Display for ToolLoopError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let n = self.calls().len();
         match self {
-            ToolLoopError::Llm(e) => e.fmt(f),
+            ToolLoopError::Llm { error, .. } if n == 0 => error.fmt(f),
+            ToolLoopError::Llm { error, .. } => write!(f, "{error} (after {n} tool call(s))"),
             ToolLoopError::MaxSteps { max_steps, .. } => write!(
                 f,
                 "model still calling tools after {max_steps} step(s) ({n} tool call(s))"
@@ -551,7 +560,10 @@ impl std::error::Error for ToolLoopError {}
 
 impl From<LlmError> for ToolLoopError {
     fn from(e: LlmError) -> Self {
-        ToolLoopError::Llm(e)
+        ToolLoopError::Llm {
+            error: e,
+            calls: Vec::new(),
+        }
     }
 }
 
@@ -671,7 +683,8 @@ impl<S: ToolSet> Toolbox<S> {
             )
             .await;
             let response = match reply {
-                Ok(response) => response?,
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => return Err(ToolLoopError::Llm { error, calls }),
                 Err(reason) => return Err(ToolLoopError::Stopped { reason, calls }),
             };
             observe(LoopEvent::ModelResponded {
@@ -703,6 +716,14 @@ impl<S: ToolSet> Toolbox<S> {
                 });
             }
 
+            // A reply cut off at the length limit or filtered may hold calls
+            // the model never meant to finish; run none of them.
+            if matches!(
+                response.finish,
+                FinishReason::Length | FinishReason::ContentFilter
+            ) {
+                return Err(ToolLoopError::Unfinished { response, calls });
+            }
             if let Some(reason) = invalid_turn(&requested) {
                 return Err(ToolLoopError::InvalidTurn { reason, calls });
             }
@@ -717,7 +738,9 @@ impl<S: ToolSet> Toolbox<S> {
             }
 
             request = request.message(response.message);
-            let batch_start = calls.len();
+            // Full results of this reply, for the observer: the model may see
+            // a truncated copy, but an artifact id must survive intact.
+            let mut batch: Vec<(ToolCall, ToolResult)> = Vec::new();
             for call in requested {
                 if options.max_tool_calls.is_some_and(|max| calls.len() >= max) {
                     return Err(ToolLoopError::LimitExceeded {
@@ -729,12 +752,16 @@ impl<S: ToolSet> Toolbox<S> {
                     return Err(ToolLoopError::Stopped { reason, calls });
                 }
                 observe(LoopEvent::ToolCall(&call));
-                let mut result = match CancelToken::race(&signals, self.dispatch(&call)).await {
+                let full = match CancelToken::race(&signals, self.dispatch(&call)).await {
                     Ok(result) => result,
                     Err(reason) => return Err(ToolLoopError::Stopped { reason, calls }),
                 };
+                let mut result = full.clone();
                 if let Some(max) = options.max_result_bytes {
                     truncate_result(&mut result.content, max);
+                }
+                if options.observer.is_some() && !full.is_error {
+                    batch.push((call.clone(), full));
                 }
                 observe(LoopEvent::ToolResult(&call, &result));
                 request = request.message(Message::tool_result(result.clone()));
@@ -770,7 +797,7 @@ impl<S: ToolSet> Toolbox<S> {
 
             if let Some(observer) = &options.observer {
                 let mut parts = Vec::new();
-                for (call, result) in calls[batch_start..].iter().filter(|(_, r)| !r.is_error) {
+                for (call, result) in &batch {
                     let observed =
                         CancelToken::race(&signals, observer.observe(call, result)).await;
                     let observations = match observed {

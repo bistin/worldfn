@@ -353,6 +353,9 @@ impl LlmProvider for OpenAiCompatLlm {
     }
 }
 
+/// Most tool calls accepted in one streamed reply.
+const MAX_STREAMED_TOOL_CALLS: u64 = 128;
+
 /// Accumulates `chat.completion.chunk` events into a non-streaming body.
 #[derive(Default)]
 struct ChunkStream {
@@ -401,7 +404,15 @@ impl ChunkStream {
             let index = call
                 .get("index")
                 .and_then(Value::as_u64)
-                .map_or(self.calls.len().saturating_sub(1), |i| i as usize);
+                .map_or(self.calls.len().saturating_sub(1) as u64, |i| i);
+            // The index comes from the server: bound it before allocating.
+            if index >= MAX_STREAMED_TOOL_CALLS {
+                return Err(LlmError(format!(
+                    "{provider}: stream tool call index {index} exceeds the limit of \
+                     {MAX_STREAMED_TOOL_CALLS}"
+                )));
+            }
+            let index = index as usize;
             if self.calls.len() <= index {
                 self.calls.resize_with(index + 1, Default::default);
             }

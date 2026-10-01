@@ -571,6 +571,24 @@ async fn openai_compatible_stream_errors_and_truncation() -> TestResult {
         .await
         .unwrap_err();
     assert!(err.0.contains("ended before"), "{err}");
+
+    // A hostile index must fail, not allocate.
+    let (url, _server) = serve_once(
+        "200 OK",
+        "text/event-stream",
+        vec![
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":18446744073709551615,\
+             \"id\":\"c\",\"function\":{\"name\":\"x\",\"arguments\":\"{}\"}}]}}]}\n\n"
+                .into(),
+        ],
+    )
+    .await;
+    let llm = Llm::new(OpenAiCompatLlm::new(&url, "sk", "m"));
+    let err = llm
+        .chat_streaming(ChatRequest::prompt("x"), |_| {})
+        .await
+        .unwrap_err();
+    assert!(err.0.contains("exceeds the limit"), "{err}");
     Ok(())
 }
 

@@ -196,6 +196,33 @@ approval before a tool runs or parallel calls, use `definitions` and
 Tool arguments must be JSON objects, so a non-object `Request` (e.g.
 `String`) is wrapped as `{"input": ...}` and unwrapped on dispatch.
 
+A `ToolSet` is a single tool or a tuple of 1 to 8 tool sets, so tuples nest:
+`Toolbox<((A, B, C, D, E), (F, G, H, I))>` is nine tools, still listed one by
+one in the agent's requirement tree, still one `AgentParam`.
+
+`Toolbox::run_with` takes `LoopOptions` for anything that runs unattended.
+The loop guarantees, with or without options:
+
+- **The model sees exactly the toolbox.** `request.tools` is replaced by the
+  toolbox's definitions; duplicate names fail before the first call
+  (`InvalidToolSurface`).
+- **A reply is checked before anything runs.** Tool calls need non-empty ids,
+  unique within the reply, since results are matched by id. Otherwise
+  `InvalidTurn`, and none of that reply's calls run.
+- **Only a complete answer ends a run.** No tool calls and `Stop` (or `Other`)
+  with non-empty text. A reply cut at the length limit, filtered, empty, or
+  claiming calls it did not make is `Unfinished`, never a result.
+- **The transcript is complete.** `ToolRun.request` ends with the final
+  answer, so it can be stored or continued as is.
+
+Options add budgets (tool calls per run and per reply, failed calls, the same
+call failing repeatedly), a cap on result size (cut with a note the model
+sees), a time limit, and a `CancelToken`. Every error carries the calls made
+so far (`ToolLoopError::calls`). Deadlines and cancellation use `std` only
+(`worldfn::cancel`), like `Emit`. Stopping abandons the in-flight future at
+its next await point; work outside the process (a remote command) needs its
+own cleanup, which is the adapter's job.
+
 ### Streaming
 
 `LlmProvider::chat_streaming` takes a `&mut dyn FnMut(ChatDelta)` callback

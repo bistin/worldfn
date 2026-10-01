@@ -22,8 +22,12 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use std::time::Duration;
+
+use crate::cancel::{CancelToken, Deadline, StopReason};
 use crate::chat::{
-    ChatDelta, ChatRequest, ChatResponse, Message, ToolCall, ToolDefinition, ToolResult, Usage,
+    ChatDelta, ChatRequest, ChatResponse, FinishReason, Message, ToolCall, ToolDefinition,
+    ToolResult, Usage,
 };
 use crate::{
     AgentParam, AgentWorld, BoxFuture, Llm, LlmError, ParamError, Requirement, Scope, Tool,
@@ -122,10 +126,11 @@ where
     }
 }
 
-/// A tuple of model-callable tools. Implemented for tuples of 1 to 8
-/// `ModelTool`s.
+/// Model-callable tools: a single `ModelTool`, or a tuple of 1 to 8 tool
+/// sets. Tuples nest, so more than eight tools can be grouped, e.g.
+/// `Toolbox<((A, B, C, D, E), (F, G, H, I))>`.
 pub trait ToolSet: Send + 'static {
-    /// One `Tool<T>` handle per tool.
+    /// The `Tool<T>` handles, shaped like the set.
     type Handles: Clone + Send + Sync + 'static;
 
     fn describe(out: &mut Vec<Requirement>);
@@ -138,36 +143,67 @@ pub trait ToolSet: Send + 'static {
     ) -> Option<BoxFuture<'a, ToolResult>>;
 }
 
+impl<T> ToolSet for T
+where
+    T: ToolSpec,
+    T::Request: DeserializeOwned + JsonSchema,
+    T::Response: Serialize,
+{
+    type Handles = Tool<T>;
+
+    fn describe(out: &mut Vec<Requirement>) {
+        <Tool<T> as AgentParam>::describe(out);
+    }
+
+    fn init(world: &AgentWorld) -> Result<Tool<T>, Vec<Requirement>> {
+        world.resource::<Tool<T>>().cloned().ok_or_else(|| {
+            let mut missing = Vec::new();
+            Self::describe(&mut missing);
+            missing
+        })
+    }
+
+    fn definitions() -> Vec<ToolDefinition> {
+        vec![definition::<T>()]
+    }
+
+    fn dispatch<'a>(handle: &'a Tool<T>, call: &'a ToolCall) -> Option<BoxFuture<'a, ToolResult>> {
+        (call.name == T::NAME).then(|| Box::pin(call_one(handle, call)) as BoxFuture<'a, _>)
+    }
+}
+
 macro_rules! impl_tool_set {
     () => {};
-    ($($T:ident),+) => {
-        impl<$($T),+> ToolSet for ($($T,)+)
-        where
-            $($T: ToolSpec, $T::Request: DeserializeOwned + JsonSchema, $T::Response: Serialize,)+
-        {
-            type Handles = ($(Tool<$T>,)+);
+    ($($S:ident),+) => {
+        impl<$($S: ToolSet),+> ToolSet for ($($S,)+) {
+            type Handles = ($($S::Handles,)+);
 
             fn describe(out: &mut Vec<Requirement>) {
-                $(<Tool<$T> as AgentParam>::describe(out);)+
+                $($S::describe(out);)+
             }
 
             #[allow(non_snake_case)]
             fn init(world: &AgentWorld) -> Result<Self::Handles, Vec<Requirement>> {
                 let mut missing = Vec::new();
                 $(
-                    let $T = world.resource::<Tool<$T>>().cloned();
-                    if $T.is_none() {
-                        <Tool<$T> as AgentParam>::describe(&mut missing);
-                    }
+                    let $S = match $S::init(world) {
+                        Ok(handles) => Some(handles),
+                        Err(unmet) => {
+                            missing.extend(unmet);
+                            None
+                        }
+                    };
                 )+
-                if !missing.is_empty() {
-                    return Err(missing);
+                match ($($S,)+) {
+                    ($(Some($S),)+) => Ok(($($S,)+)),
+                    _ => Err(missing),
                 }
-                Ok(($($T.unwrap(),)+))
             }
 
             fn definitions() -> Vec<ToolDefinition> {
-                vec![$(definition::<$T>()),+]
+                let mut all = Vec::new();
+                $(all.extend($S::definitions());)+
+                all
             }
 
             #[allow(non_snake_case)]
@@ -175,10 +211,10 @@ macro_rules! impl_tool_set {
                 handles: &'a Self::Handles,
                 call: &'a ToolCall,
             ) -> Option<BoxFuture<'a, ToolResult>> {
-                let ($($T,)+) = handles;
+                let ($($S,)+) = handles;
                 $(
-                    if call.name == $T::NAME {
-                        return Some(Box::pin(call_one($T, call)));
+                    if let Some(result) = $S::dispatch($S, call) {
+                        return Some(result);
                     }
                 )+
                 None
@@ -187,7 +223,7 @@ macro_rules! impl_tool_set {
     };
 }
 
-all_tuples!(impl_tool_set; T0, T1, T2, T3, T4, T5, T6, T7);
+all_tuples!(impl_tool_set; S0, S1, S2, S3, S4, S5, S6, S7);
 
 /// Parameter: the tools a model may call during this invocation.
 pub struct Toolbox<S: ToolSet> {
@@ -255,8 +291,8 @@ pub enum LoopEvent<'a> {
 pub struct ToolRun {
     /// The model's final answer.
     pub response: ChatResponse,
-    /// The request as it ended: the original messages plus every tool call
-    /// and result, ready to continue the conversation.
+    /// The whole conversation: the original messages, every tool call and
+    /// result, and the final answer. Append a user message to continue it.
     pub request: ChatRequest,
     /// Every call made, with its result, in order.
     pub calls: Vec<(ToolCall, ToolResult)>,
@@ -266,7 +302,95 @@ pub struct ToolRun {
     pub steps: usize,
 }
 
+/// Limits for [`Toolbox::run_with`]. Only `max_steps` is required; every
+/// other limit is off until set.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct LoopOptions {
+    /// Model calls, including the final one.
+    pub max_steps: usize,
+    /// Tool calls over the whole run, failed ones included.
+    pub max_tool_calls: Option<usize>,
+    /// Tool calls the model may request in one reply.
+    pub max_calls_per_turn: Option<usize>,
+    /// Failed tool calls (bad arguments, unknown tools, tool errors) over the
+    /// whole run.
+    pub max_failed_calls: Option<usize>,
+    /// The same call (name and arguments) failing this many times in a row.
+    pub max_repeated_failures: Option<usize>,
+    /// Tool results longer than this many bytes are cut, with a note saying
+    /// so, before the model sees them.
+    pub max_result_bytes: Option<usize>,
+    /// Time limit for the whole run, model calls and tools included.
+    pub timeout: Option<Duration>,
+    /// Stops the run when cancelled.
+    pub cancel: Option<CancelToken>,
+}
+
+impl LoopOptions {
+    pub fn new(max_steps: usize) -> Self {
+        Self {
+            max_steps,
+            max_tool_calls: None,
+            max_calls_per_turn: None,
+            max_failed_calls: None,
+            max_repeated_failures: None,
+            max_result_bytes: None,
+            timeout: None,
+            cancel: None,
+        }
+    }
+
+    pub fn max_tool_calls(mut self, n: usize) -> Self {
+        self.max_tool_calls = Some(n);
+        self
+    }
+
+    pub fn max_calls_per_turn(mut self, n: usize) -> Self {
+        self.max_calls_per_turn = Some(n);
+        self
+    }
+
+    pub fn max_failed_calls(mut self, n: usize) -> Self {
+        self.max_failed_calls = Some(n);
+        self
+    }
+
+    pub fn max_repeated_failures(mut self, n: usize) -> Self {
+        self.max_repeated_failures = Some(n);
+        self
+    }
+
+    pub fn max_result_bytes(mut self, n: usize) -> Self {
+        self.max_result_bytes = Some(n);
+        self
+    }
+
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn cancel(mut self, token: CancelToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+}
+
+/// Which [`LoopOptions`] limit ended a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopLimit {
+    ToolCalls,
+    CallsPerTurn,
+    FailedCalls,
+    RepeatedFailures,
+}
+
+/// Every error but [`Llm`](Self::Llm) and
+/// [`InvalidToolSurface`](Self::InvalidToolSurface) carries the calls made
+/// so far, for a report; see [`calls`](Self::calls).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ToolLoopError {
     Llm(LlmError),
     /// The model was still calling tools after `max_steps` model calls.
@@ -274,17 +398,71 @@ pub enum ToolLoopError {
         max_steps: usize,
         calls: Vec<(ToolCall, ToolResult)>,
     },
+    /// The model stopped without a usable answer: cut off at the length
+    /// limit, blocked by a content filter, empty, or claiming tool calls it
+    /// did not make. A reply like that is never treated as the result.
+    Unfinished {
+        response: ChatResponse,
+        calls: Vec<(ToolCall, ToolResult)>,
+    },
+    /// A reply that cannot be executed safely, e.g. tool calls with empty or
+    /// duplicate ids. Nothing from that reply was run.
+    InvalidTurn {
+        reason: String,
+        calls: Vec<(ToolCall, ToolResult)>,
+    },
+    LimitExceeded {
+        limit: LoopLimit,
+        calls: Vec<(ToolCall, ToolResult)>,
+    },
+    /// Cancelled or out of time. A tool that was running was abandoned at its
+    /// next await point; its result is not in `calls`.
+    Stopped {
+        reason: StopReason,
+        calls: Vec<(ToolCall, ToolResult)>,
+    },
+    /// Two tools in the toolbox share a name.
+    InvalidToolSurface(String),
+}
+
+impl ToolLoopError {
+    /// The tool calls completed before the error.
+    pub fn calls(&self) -> &[(ToolCall, ToolResult)] {
+        match self {
+            ToolLoopError::MaxSteps { calls, .. }
+            | ToolLoopError::Unfinished { calls, .. }
+            | ToolLoopError::InvalidTurn { calls, .. }
+            | ToolLoopError::LimitExceeded { calls, .. }
+            | ToolLoopError::Stopped { calls, .. } => calls,
+            ToolLoopError::Llm(_) | ToolLoopError::InvalidToolSurface(_) => &[],
+        }
+    }
 }
 
 impl fmt::Display for ToolLoopError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let n = self.calls().len();
         match self {
             ToolLoopError::Llm(e) => e.fmt(f),
-            ToolLoopError::MaxSteps { max_steps, calls } => write!(
+            ToolLoopError::MaxSteps { max_steps, .. } => write!(
                 f,
-                "model still calling tools after {max_steps} step(s) ({} tool call(s))",
-                calls.len()
+                "model still calling tools after {max_steps} step(s) ({n} tool call(s))"
             ),
+            ToolLoopError::Unfinished { response, .. } => write!(
+                f,
+                "model stopped without a usable answer (finish: {:?}, {n} tool call(s))",
+                response.finish
+            ),
+            ToolLoopError::InvalidTurn { reason, .. } => {
+                write!(f, "invalid model reply: {reason} ({n} tool call(s))")
+            }
+            ToolLoopError::LimitExceeded { limit, .. } => {
+                write!(f, "loop limit reached: {limit:?} ({n} tool call(s))")
+            }
+            ToolLoopError::Stopped { reason, .. } => {
+                write!(f, "tool loop stopped: {reason} ({n} tool call(s))")
+            }
+            ToolLoopError::InvalidToolSurface(reason) => write!(f, "invalid toolbox: {reason}"),
         }
     }
 }
@@ -325,35 +503,94 @@ impl<S: ToolSet> Toolbox<S> {
 
     /// Call the model with these tools, run what it asks for, and repeat
     /// until it answers without tool calls, at most `max_steps` model calls.
-    /// Calls within one model turn run in order. `observe` sees streamed reply
-    /// text and each call and result as they happen (e.g. to forward them
-    /// through an `Emit`).
+    /// Same as [`run_with`](Self::run_with) with only a step limit.
     pub async fn run(
         &self,
         llm: &Llm,
         request: ChatRequest,
         max_steps: usize,
+        observe: impl FnMut(LoopEvent<'_>) + Send,
+    ) -> Result<ToolRun, ToolLoopError> {
+        self.run_with(llm, request, LoopOptions::new(max_steps), observe)
+            .await
+    }
+
+    /// The tool loop. Each step sends the conversation with exactly this
+    /// toolbox's tools (replacing any in `request`), then:
+    ///
+    /// - a reply with tool calls is checked as a whole (ids, call count)
+    ///   before any call runs; calls run in order and their results are
+    ///   appended for the next step;
+    /// - a reply without tool calls ends the run if it is a complete answer
+    ///   (`Stop`, or `Other` with text), and fails as
+    ///   [`Unfinished`](ToolLoopError::Unfinished) otherwise.
+    ///
+    /// `observe` sees streamed text, each call and result, and each model
+    /// call's usage, e.g. to forward them through an `Emit`.
+    pub async fn run_with(
+        &self,
+        llm: &Llm,
+        request: ChatRequest,
+        options: LoopOptions,
         mut observe: impl FnMut(LoopEvent<'_>) + Send,
     ) -> Result<ToolRun, ToolLoopError> {
+        let definitions = self.definitions();
+        let mut names = std::collections::HashSet::new();
+        for definition in &definitions {
+            if !names.insert(definition.name.as_str()) {
+                return Err(ToolLoopError::InvalidToolSurface(format!(
+                    "tool name `{}` is used twice",
+                    definition.name
+                )));
+            }
+        }
+
         let mut request = request;
+        // The model sees exactly what `dispatch` can reach.
+        request.tools = definitions;
         // Every step shares one prompt prefix; let the provider route them
         // to the same cache.
         if request.cache_key.is_none() {
             request.cache_key = Some(run_cache_key());
         }
-        for definition in self.definitions() {
-            if !request.tools.iter().any(|t| t.name == definition.name) {
-                request.tools.push(definition);
-            }
-        }
-        let mut calls = Vec::new();
-        let mut usage = Usage::default();
-        for step in 1..=max_steps {
-            let response = llm
-                .chat_streaming(request.clone(), |delta| match delta {
-                    ChatDelta::Text(text) => observe(LoopEvent::Text(&text)),
+
+        let deadline_signal = CancelToken::new();
+        let deadline = options
+            .timeout
+            .map(|t| Deadline::start(t, deadline_signal.clone()));
+        let caller_signal = options.cancel.clone().unwrap_or_default();
+        let signals = [&caller_signal, &deadline_signal];
+        let stop_reason = || {
+            caller_signal.reason().or_else(|| {
+                deadline_signal.reason().or_else(|| {
+                    deadline
+                        .as_ref()
+                        .filter(|d| d.passed())
+                        .map(|_| StopReason::DeadlineExceeded)
                 })
-                .await?;
+            })
+        };
+
+        let mut calls: Vec<(ToolCall, ToolResult)> = Vec::new();
+        let mut usage = Usage::default();
+        let mut failed = 0usize;
+        let mut repeated: Option<(String, String, usize)> = None;
+
+        for step in 1..=options.max_steps {
+            if let Some(reason) = stop_reason() {
+                return Err(ToolLoopError::Stopped { reason, calls });
+            }
+            let reply = CancelToken::race(
+                &signals,
+                llm.chat_streaming(request.clone(), |delta| match delta {
+                    ChatDelta::Text(text) => observe(LoopEvent::Text(&text)),
+                }),
+            )
+            .await;
+            let response = match reply {
+                Ok(response) => response?,
+                Err(reason) => return Err(ToolLoopError::Stopped { reason, calls }),
+            };
             observe(LoopEvent::ModelResponded {
                 step,
                 usage: response.usage.as_ref(),
@@ -361,8 +598,19 @@ impl<S: ToolSet> Toolbox<S> {
             if let Some(u) = response.usage {
                 usage += u;
             }
+
             let requested: Vec<ToolCall> = response.message.tool_calls().cloned().collect();
             if requested.is_empty() {
+                let has_text = !response.message.text().trim().is_empty();
+                let complete = match response.finish {
+                    FinishReason::Stop => has_text,
+                    FinishReason::Other => has_text,
+                    _ => false,
+                };
+                if !complete {
+                    return Err(ToolLoopError::Unfinished { response, calls });
+                }
+                request = request.message(response.message.clone());
                 return Ok(ToolRun {
                     response,
                     request,
@@ -371,17 +619,108 @@ impl<S: ToolSet> Toolbox<S> {
                     steps: step,
                 });
             }
+
+            if let Some(reason) = invalid_turn(&requested) {
+                return Err(ToolLoopError::InvalidTurn { reason, calls });
+            }
+            if options
+                .max_calls_per_turn
+                .is_some_and(|max| requested.len() > max)
+            {
+                return Err(ToolLoopError::LimitExceeded {
+                    limit: LoopLimit::CallsPerTurn,
+                    calls,
+                });
+            }
+
             request = request.message(response.message);
             for call in requested {
+                if options.max_tool_calls.is_some_and(|max| calls.len() >= max) {
+                    return Err(ToolLoopError::LimitExceeded {
+                        limit: LoopLimit::ToolCalls,
+                        calls,
+                    });
+                }
+                if let Some(reason) = stop_reason() {
+                    return Err(ToolLoopError::Stopped { reason, calls });
+                }
                 observe(LoopEvent::ToolCall(&call));
-                let result = self.dispatch(&call).await;
+                let mut result = match CancelToken::race(&signals, self.dispatch(&call)).await {
+                    Ok(result) => result,
+                    Err(reason) => return Err(ToolLoopError::Stopped { reason, calls }),
+                };
+                if let Some(max) = options.max_result_bytes {
+                    truncate_result(&mut result.content, max);
+                }
                 observe(LoopEvent::ToolResult(&call, &result));
                 request = request.message(Message::tool_result(result.clone()));
+
+                let limit = if result.is_error {
+                    failed += 1;
+                    let count = match &repeated {
+                        Some((name, args, n)) if *name == call.name && *args == call.arguments => {
+                            n + 1
+                        }
+                        _ => 1,
+                    };
+                    repeated = Some((call.name.clone(), call.arguments.clone(), count));
+                    if options
+                        .max_repeated_failures
+                        .is_some_and(|max| count >= max)
+                    {
+                        Some(LoopLimit::RepeatedFailures)
+                    } else if options.max_failed_calls.is_some_and(|max| failed > max) {
+                        Some(LoopLimit::FailedCalls)
+                    } else {
+                        None
+                    }
+                } else {
+                    repeated = None;
+                    None
+                };
                 calls.push((call, result));
+                if let Some(limit) = limit {
+                    return Err(ToolLoopError::LimitExceeded { limit, calls });
+                }
             }
         }
-        Err(ToolLoopError::MaxSteps { max_steps, calls })
+        Err(ToolLoopError::MaxSteps {
+            max_steps: options.max_steps,
+            calls,
+        })
     }
+}
+
+/// Why a reply's tool calls cannot be run, if they cannot.
+fn invalid_turn(calls: &[ToolCall]) -> Option<String> {
+    let mut ids = std::collections::HashSet::new();
+    for call in calls {
+        if call.id.is_empty() {
+            return Some(format!("tool call `{}` has no id", call.name));
+        }
+        // Results are matched to calls by id, so ids must be unique within a
+        // reply. Providers differ on uniqueness across replies; that is not
+        // required here.
+        if !ids.insert(call.id.as_str()) {
+            return Some(format!("tool call id `{}` is used twice", call.id));
+        }
+    }
+    None
+}
+
+/// Cut `content` to at most `max` bytes (on a character boundary) and say
+/// how much was dropped.
+fn truncate_result(content: &mut String, max: usize) {
+    if content.len() <= max {
+        return;
+    }
+    let total = content.len();
+    let cut = (0..=max)
+        .rev()
+        .find(|&i| content.is_char_boundary(i))
+        .unwrap_or(0);
+    content.truncate(cut);
+    content.push_str(&format!("\n[truncated: showing {cut} of {total} bytes]"));
 }
 
 /// A key unique to this process and run; not a secret.

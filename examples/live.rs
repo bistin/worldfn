@@ -15,6 +15,7 @@
 //! The agent is the same whichever provider is chosen; only the world differs.
 
 use worldfn::prelude::*;
+use worldfn::{ChatDelta, ChatRequest};
 
 mod common;
 
@@ -36,14 +37,19 @@ async fn assistant(
         task.0
     );
     // Print the reply as it is generated.
-    let answer = llm
-        .complete_streaming(prompt, |text| {
-            print!("{text}");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+    let response = llm
+        .chat_streaming(ChatRequest::prompt(prompt), |delta| {
+            if let ChatDelta::Text(text) = delta {
+                print!("{text}");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
         })
         .await?;
     println!();
-    Ok(answer)
+    if let Some(usage) = response.usage {
+        println!("\n[tokens] {usage}");
+    }
+    Ok(response.message.text())
 }
 
 #[tokio::main(flavor = "current_thread")]

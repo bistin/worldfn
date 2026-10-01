@@ -55,6 +55,10 @@ async fn mentor(
             |event| match event {
                 LoopEvent::ToolCall(call) => println!("  → {}({})", call.name, call.arguments),
                 LoopEvent::ToolResult(_, result) => println!("  ← {}", result.content),
+                LoopEvent::ModelResponded {
+                    step,
+                    usage: Some(usage),
+                } => println!("\n  [model call {step}] {usage}"),
                 // The answer, printed as it is generated.
                 LoopEvent::Text(text) => {
                     print!("{text}");
@@ -64,7 +68,10 @@ async fn mentor(
             },
         )
         .await?;
-    println!("\n\n  ({} model call(s))", run.steps);
+    println!("\n  ({} model call(s))", run.steps);
+    if run.usage != Default::default() {
+        println!("  [total] {}", run.usage);
+    }
     Ok(run.response.message.text())
 }
 

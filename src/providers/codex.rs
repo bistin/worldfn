@@ -190,6 +190,9 @@ impl CodexLlm {
             "store": false,
             "stream": true,
         });
+        if let Some(key) = &request.cache_key {
+            body["prompt_cache_key"] = json!(key);
+        }
         if !request.tools.is_empty() {
             let tools = request
                 .tools
@@ -537,10 +540,7 @@ impl CodexStream {
                         .filter_map(function_call)
                         .collect();
                 }
-                self.usage = response.get("usage").map(|u| Usage {
-                    input_tokens: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
-                    output_tokens: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
-                });
+                self.usage = response.get("usage").map(responses_usage);
                 self.truncated = kind == "response.incomplete"
                     || response
                         .pointer("/incomplete_details/reason")
@@ -579,6 +579,17 @@ impl CodexStream {
                 "codex: stream ended before the response completed".into(),
             ))
         }
+    }
+}
+
+/// Responses-API usage, including cached input and reasoning tokens.
+fn responses_usage(u: &Value) -> Usage {
+    let n = |pointer: &str| u.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
+    Usage {
+        input_tokens: n("/input_tokens"),
+        cached_input_tokens: n("/input_tokens_details/cached_tokens"),
+        output_tokens: n("/output_tokens"),
+        reasoning_tokens: n("/output_tokens_details/reasoning_tokens"),
     }
 }
 

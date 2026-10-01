@@ -41,6 +41,7 @@ pub struct OpenAiCompatLlm {
     system: Option<String>,
     name: &'static str,
     json_mode: JsonMode,
+    send_cache_key: bool,
 }
 
 impl OpenAiCompatLlm {
@@ -60,6 +61,7 @@ impl OpenAiCompatLlm {
             system: None,
             name: "openai-compatible",
             json_mode: JsonMode::Instructions,
+            send_cache_key: false,
         }
     }
 
@@ -80,6 +82,7 @@ impl OpenAiCompatLlm {
         let mut llm = Self::new("https://api.openai.com/v1", key, model);
         llm.name = "openai";
         llm.json_mode = JsonMode::Schema;
+        llm.send_cache_key = true;
         Ok(llm)
     }
 
@@ -93,6 +96,14 @@ impl OpenAiCompatLlm {
     /// `Object` for [`deepseek`](Self::deepseek), `Instructions` otherwise.
     pub fn json_mode(mut self, mode: JsonMode) -> Self {
         self.json_mode = mode;
+        self
+    }
+
+    /// Send [`ChatRequest::cache_key`] as `prompt_cache_key`. On by default
+    /// only for [`openai`](Self::openai): other servers may reject unknown
+    /// fields, and DeepSeek caches prefixes without a key.
+    pub fn send_cache_key(mut self, enabled: bool) -> Self {
+        self.send_cache_key = enabled;
         self
     }
 
@@ -159,6 +170,9 @@ impl OpenAiCompatLlm {
         }
         if let Some(max) = request.max_output_tokens {
             body["max_tokens"] = json!(max);
+        }
+        if let (true, Some(key)) = (self.send_cache_key, &request.cache_key) {
+            body["prompt_cache_key"] = json!(key);
         }
         Ok(body)
     }
@@ -250,12 +264,18 @@ pub(crate) fn parse_response(provider: &str, body: &Value) -> Result<ChatRespons
         Some("content_filter") => FinishReason::ContentFilter,
         _ => FinishReason::Other,
     };
-    let usage = body.get("usage").map(|u| Usage {
-        input_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
-        output_tokens: u
-            .get("completion_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+    let usage = body.get("usage").map(|u| {
+        let n = |pointer: &str| u.pointer(pointer).and_then(Value::as_u64);
+        Usage {
+            input_tokens: n("/prompt_tokens").unwrap_or(0),
+            // OpenAI, DeepSeek, and some other servers name this differently.
+            cached_input_tokens: n("/prompt_tokens_details/cached_tokens")
+                .or_else(|| n("/prompt_cache_hit_tokens"))
+                .or_else(|| n("/cached_tokens"))
+                .unwrap_or(0),
+            output_tokens: n("/completion_tokens").unwrap_or(0),
+            reasoning_tokens: n("/completion_tokens_details/reasoning_tokens").unwrap_or(0),
+        }
     });
     Ok(ChatResponse {
         message: Message {
@@ -333,6 +353,9 @@ impl LlmProvider for OpenAiCompatLlm {
     }
 }
 
+/// Most tool calls accepted in one streamed reply.
+const MAX_STREAMED_TOOL_CALLS: u64 = 128;
+
 /// Accumulates `chat.completion.chunk` events into a non-streaming body.
 #[derive(Default)]
 struct ChunkStream {
@@ -381,7 +404,15 @@ impl ChunkStream {
             let index = call
                 .get("index")
                 .and_then(Value::as_u64)
-                .map_or(self.calls.len().saturating_sub(1), |i| i as usize);
+                .map_or(self.calls.len().saturating_sub(1) as u64, |i| i);
+            // The index comes from the server: bound it before allocating.
+            if index >= MAX_STREAMED_TOOL_CALLS {
+                return Err(LlmError(format!(
+                    "{provider}: stream tool call index {index} exceeds the limit of \
+                     {MAX_STREAMED_TOOL_CALLS}"
+                )));
+            }
+            let index = index as usize;
             if self.calls.len() <= index {
                 self.calls.resize_with(index + 1, Default::default);
             }

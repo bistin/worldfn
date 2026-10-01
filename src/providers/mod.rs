@@ -153,3 +153,26 @@ impl<'a> DeltaForwarder<'a> {
         }
     }
 }
+
+/// An image as a `data:` URL, the form both supported APIs accept.
+pub(crate) fn data_url(image: &crate::chat::Image) -> String {
+    use base64::Engine as _;
+    format!(
+        "data:{};base64,{}",
+        image.media_type(),
+        base64::engine::general_purpose::STANDARD.encode(image.bytes())
+    )
+}
+
+/// Images may only appear in user messages.
+pub(crate) fn reject_misplaced_images(
+    provider: &str,
+    message: &crate::chat::Message,
+) -> Result<(), LlmError> {
+    if message.role != crate::chat::MessageRole::User && message.images().next().is_some() {
+        return Err(LlmError(format!(
+            "{provider}: images are only supported in user messages"
+        )));
+    }
+    Ok(())
+}

@@ -25,9 +25,11 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 use crate::cancel::{CancelToken, Deadline, StopReason};
+use std::sync::Arc;
+
 use crate::chat::{
-    ChatDelta, ChatRequest, ChatResponse, FinishReason, Message, ToolCall, ToolDefinition,
-    ToolResult, Usage,
+    ChatDelta, ChatRequest, ChatResponse, FinishReason, Image, Message, Part, ToolCall,
+    ToolDefinition, ToolResult, Usage,
 };
 use crate::{
     AgentParam, AgentWorld, BoxFuture, Llm, LlmError, ParamError, Requirement, Scope, Tool,
@@ -284,6 +286,8 @@ pub enum LoopEvent<'a> {
         step: usize,
         usage: Option<&'a Usage>,
     },
+    /// An [`Observer`] attached an image for the model, from this call.
+    Observed(&'a ToolCall, &'a Observation),
 }
 
 /// The outcome of [`Toolbox::run`].
@@ -302,9 +306,49 @@ pub struct ToolRun {
     pub steps: usize,
 }
 
+/// An image produced by a tool, for the model to look at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observation {
+    /// Shown to the model next to the image, e.g. `"screenshot ss-3 of the
+    /// desktop"`.
+    pub label: String,
+    pub image: Image,
+}
+
+/// Turns successful tool results into images for the model, e.g. the PNG
+/// behind a screenshot tool's artifact id.
+///
+/// Tool results are text, so a screenshot tool returns metadata (an id, a
+/// size, a hash) and the observer, which the host trusts, looks the pixels up
+/// in its own store. The model never names a file to read.
+///
+/// After all calls of one reply have run, their images are sent in a single
+/// user message, so every call's result stays right after the call. Plain
+/// closures `Fn(&ToolCall, &ToolResult) -> Vec<Observation>` implement this.
+pub trait Observer: Send + Sync {
+    fn observe<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        result: &'a ToolResult,
+    ) -> BoxFuture<'a, Vec<Observation>>;
+}
+
+impl<F> Observer for F
+where
+    F: Fn(&ToolCall, &ToolResult) -> Vec<Observation> + Send + Sync,
+{
+    fn observe<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        result: &'a ToolResult,
+    ) -> BoxFuture<'a, Vec<Observation>> {
+        Box::pin(std::future::ready(self(call, result)))
+    }
+}
+
 /// Limits for [`Toolbox::run_with`]. Only `max_steps` is required; every
 /// other limit is off until set.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct LoopOptions {
     /// Model calls, including the final one.
@@ -325,6 +369,30 @@ pub struct LoopOptions {
     pub timeout: Option<Duration>,
     /// Stops the run when cancelled.
     pub cancel: Option<CancelToken>,
+    /// Attaches images to tool results; see [`Observer`].
+    pub observer: Option<Arc<dyn Observer>>,
+    /// Most images kept in the conversation. When a step would exceed it, the
+    /// oldest images are replaced by a short text note until half the limit
+    /// remains. Pruning in large, rare steps keeps the prompt prefix stable
+    /// for caching between prunes.
+    pub max_images: Option<usize>,
+}
+
+impl fmt::Debug for LoopOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoopOptions")
+            .field("max_steps", &self.max_steps)
+            .field("max_tool_calls", &self.max_tool_calls)
+            .field("max_calls_per_turn", &self.max_calls_per_turn)
+            .field("max_failed_calls", &self.max_failed_calls)
+            .field("max_repeated_failures", &self.max_repeated_failures)
+            .field("max_result_bytes", &self.max_result_bytes)
+            .field("timeout", &self.timeout)
+            .field("cancel", &self.cancel)
+            .field("observer", &self.observer.as_ref().map(|_| "Observer"))
+            .field("max_images", &self.max_images)
+            .finish()
+    }
 }
 
 impl LoopOptions {
@@ -338,6 +406,8 @@ impl LoopOptions {
             max_result_bytes: None,
             timeout: None,
             cancel: None,
+            observer: None,
+            max_images: None,
         }
     }
 
@@ -373,6 +443,16 @@ impl LoopOptions {
 
     pub fn cancel(mut self, token: CancelToken) -> Self {
         self.cancel = Some(token);
+        self
+    }
+
+    pub fn observer(mut self, observer: impl Observer + 'static) -> Self {
+        self.observer = Some(Arc::new(observer));
+        self
+    }
+
+    pub fn max_images(mut self, n: usize) -> Self {
+        self.max_images = Some(n);
         self
     }
 }
@@ -580,6 +660,9 @@ impl<S: ToolSet> Toolbox<S> {
             if let Some(reason) = stop_reason() {
                 return Err(ToolLoopError::Stopped { reason, calls });
             }
+            if let Some(max) = options.max_images {
+                prune_images(&mut request, max);
+            }
             let reply = CancelToken::race(
                 &signals,
                 llm.chat_streaming(request.clone(), |delta| match delta {
@@ -634,6 +717,7 @@ impl<S: ToolSet> Toolbox<S> {
             }
 
             request = request.message(response.message);
+            let batch_start = calls.len();
             for call in requested {
                 if options.max_tool_calls.is_some_and(|max| calls.len() >= max) {
                     return Err(ToolLoopError::LimitExceeded {
@@ -683,11 +767,60 @@ impl<S: ToolSet> Toolbox<S> {
                     return Err(ToolLoopError::LimitExceeded { limit, calls });
                 }
             }
+
+            if let Some(observer) = &options.observer {
+                let mut parts = Vec::new();
+                for (call, result) in calls[batch_start..].iter().filter(|(_, r)| !r.is_error) {
+                    let observed =
+                        CancelToken::race(&signals, observer.observe(call, result)).await;
+                    let observations = match observed {
+                        Ok(observations) => observations,
+                        Err(reason) => return Err(ToolLoopError::Stopped { reason, calls }),
+                    };
+                    for observation in observations {
+                        observe(LoopEvent::Observed(call, &observation));
+                        parts.push(Part::Text(format!(
+                            "{} (from tool call {} `{}`):",
+                            observation.label, call.id, call.name
+                        )));
+                        parts.push(Part::Image(observation.image));
+                    }
+                }
+                if !parts.is_empty() {
+                    request = request.message(Message::user_parts(parts));
+                }
+            }
         }
         Err(ToolLoopError::MaxSteps {
             max_steps: options.max_steps,
             calls,
         })
+    }
+}
+
+/// Replace the oldest images with a note once there are more than `max`,
+/// keeping the newest `max / 2` (at least one).
+fn prune_images(request: &mut ChatRequest, max: usize) {
+    let total: usize = request.messages.iter().map(|m| m.images().count()).sum();
+    if total <= max {
+        return;
+    }
+    let mut to_drop = total - (max / 2).max(1).min(total);
+    for message in &mut request.messages {
+        for part in &mut message.parts {
+            if to_drop == 0 {
+                return;
+            }
+            if let Part::Image(image) = part {
+                *part = Part::Text(format!(
+                    "[earlier image removed to save context: {} {}x{}]",
+                    image.media_type(),
+                    image.width(),
+                    image.height()
+                ));
+                to_drop -= 1;
+            }
+        }
     }
 }
 

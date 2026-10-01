@@ -273,7 +273,25 @@ oldest message changes each turn and the cached prefix stops at the system
 prompt. Dropping old tool outputs or screenshots to save context has the same
 effect; do it in large, rare steps rather than a little on every call.
 
-Still missing: images.
+### Images
+
+`Part::Image(Image)` carries PNG or JPEG bytes, validated on construction
+(type and dimensions from the header) and shared behind an `Arc`, so cloning a
+request with screenshots stays cheap; `Debug` never prints pixels. Images are
+allowed in user messages only. Codex sends them as `input_image` data URLs;
+OpenAI-compatible servers as `image_url` parts, only when the provider is
+configured with `.vision(true)` (default for `openai()`). Any other case fails
+the call instead of silently dropping the image, which `Message::text()` would
+otherwise do.
+
+Tools return text, so a screenshot tool returns metadata (artifact id, size,
+hash) and an `Observer` set in `LoopOptions`, which the host trusts, resolves
+it to pixels from its own store. The model can never make the host read a
+path. After all of a reply's calls have run, their images go into one user
+message labeled with the call ids, so every result still directly follows
+its call. `LoopOptions::max_images` bounds how many stay in the conversation;
+when exceeded, the oldest are replaced by a text note until half remain, in
+one step, so the cached prefix survives between prunes.
 
 ## Skills
 

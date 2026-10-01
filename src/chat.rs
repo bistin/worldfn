@@ -21,12 +21,128 @@ pub enum MessageRole {
 
 /// One piece of a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Part {
     Text(String),
     /// The model asking for a tool to run (assistant messages only).
     ToolCall(ToolCall),
     /// The outcome of a tool call (tool messages only).
     ToolResult(ToolResult),
+    /// An image for the model to look at (user messages only). Providers
+    /// that cannot take images fail rather than drop it.
+    Image(Image),
+}
+
+/// A validated image: PNG or JPEG bytes with their dimensions. The bytes are
+/// shared, so cloning a request that carries screenshots stays cheap.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Image {
+    media_type: &'static str,
+    bytes: std::sync::Arc<[u8]>,
+    width: u32,
+    height: u32,
+}
+
+/// Why bytes were not accepted as an [`Image`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageError(pub String);
+
+impl std::fmt::Display for ImageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid image: {}", self.0)
+    }
+}
+
+impl std::error::Error for ImageError {}
+
+impl Image {
+    /// Accepts PNG (dimensions read from its header) or JPEG (dimensions
+    /// from its first frame header). Anything else is refused.
+    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Result<Self, ImageError> {
+        let bytes: Vec<u8> = bytes.into();
+        let (media_type, (width, height)) = if let Some(size) = png_size(&bytes) {
+            ("image/png", size)
+        } else if let Some(size) = jpeg_size(&bytes) {
+            ("image/jpeg", size)
+        } else {
+            return Err(ImageError("not a PNG or JPEG image".into()));
+        };
+        if width == 0 || height == 0 {
+            return Err(ImageError(format!("empty image ({width}x{height})")));
+        }
+        Ok(Self {
+            media_type,
+            bytes: bytes.into(),
+            width,
+            height,
+        })
+    }
+
+    /// `image/png` or `image/jpeg`.
+    pub fn media_type(&self) -> &'static str {
+        self.media_type
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+}
+
+/// Never prints the pixels.
+impl std::fmt::Debug for Image {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Image({}, {}x{}, {} bytes)",
+            self.media_type,
+            self.width,
+            self.height,
+            self.bytes.len()
+        )
+    }
+}
+
+fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    // Signature, then the IHDR chunk: length, "IHDR", width, height.
+    if bytes.len() < 24 || !bytes.starts_with(SIGNATURE) || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let be = |i: usize| u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+    Some((be(16), be(20)))
+}
+
+fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if !bytes.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut i = 2;
+    while i + 4 <= bytes.len() {
+        if bytes[i] != 0xFF {
+            return None;
+        }
+        let marker = bytes[i + 1];
+        let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+        // Start-of-frame markers carry the size; skip DHT (C4), JPG (C8), DAC (CC).
+        if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+            if i + 9 > bytes.len() {
+                return None;
+            }
+            let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
+            let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]) as u32;
+            return Some((w, h));
+        }
+        i += 2 + len;
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +182,14 @@ impl Message {
         }
     }
 
+    /// A user message made of parts, e.g. text and images.
+    pub fn user_parts(parts: impl IntoIterator<Item = Part>) -> Self {
+        Self {
+            role: MessageRole::User,
+            parts: parts.into_iter().collect(),
+        }
+    }
+
     pub fn tool_result(result: ToolResult) -> Self {
         Self {
             role: MessageRole::Tool,
@@ -82,6 +206,13 @@ impl Message {
                 _ => None,
             })
             .collect()
+    }
+
+    pub fn images(&self) -> impl Iterator<Item = &Image> {
+        self.parts.iter().filter_map(|p| match p {
+            Part::Image(image) => Some(image),
+            _ => None,
+        })
     }
 
     pub fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {

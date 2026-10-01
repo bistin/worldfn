@@ -613,3 +613,75 @@ async fn cache_keys_are_sent_where_supported() -> TestResult {
     }
     Ok(())
 }
+
+fn tiny_png() -> worldfn::Image {
+    let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    bytes.extend(3u32.to_be_bytes());
+    bytes.extend(2u32.to_be_bytes());
+    bytes.extend([8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    worldfn::Image::from_bytes(bytes).unwrap()
+}
+
+fn look_request() -> ChatRequest {
+    ChatRequest::new().message(Message::user_parts([
+        Part::Text("What is in this screenshot?".into()),
+        Part::Image(tiny_png()),
+    ]))
+}
+
+#[tokio::test]
+async fn images_reach_codex_as_input_image() -> TestResult {
+    let sse = vec!["data: {\"type\":\"response.completed\",\"response\":{}}\n\n".to_owned()];
+    let (url, server) = serve_once("200 OK", "text/event-stream", sse).await;
+    let auth = write_auth_json(&scratch_dir("codex-image"), 3600);
+    let llm = Llm::new(CodexLlm::from_auth_file(&auth, "gpt-test")?.base_url(&url));
+    llm.chat(look_request()).await?;
+    let content = &server.await?.body["input"][0]["content"];
+    assert_eq!(
+        content[0],
+        json!({ "type": "input_text", "text": "What is in this screenshot?" })
+    );
+    assert_eq!(content[1]["type"], "input_image");
+    assert_eq!(content[1]["detail"], "auto");
+    let url = content[1]["image_url"].as_str().unwrap();
+    assert!(
+        url.starts_with("data:image/png;base64,iVBORw0KGgo"),
+        "{url}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn images_reach_openai_compatible_vision_models_only() -> TestResult {
+    let reply = json!({ "choices": [{ "message": { "content": "a tiny image" }, "finish_reason": "stop" }] });
+    let (url, server) = serve_once("200 OK", "application/json", vec![reply.to_string()]).await;
+    let llm = Llm::new(OpenAiCompatLlm::new(&url, "sk", "m").vision(true));
+    llm.chat(look_request()).await?;
+    let content = &server.await?.body["messages"][0]["content"];
+    assert_eq!(
+        content[0],
+        json!({ "type": "text", "text": "What is in this screenshot?" })
+    );
+    assert_eq!(content[1]["type"], "image_url");
+    assert!(
+        content[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,")
+    );
+
+    // Not configured for images: fail before sending, never drop the image.
+    let llm = Llm::new(OpenAiCompatLlm::new("http://127.0.0.1:9", "sk", "m"));
+    let err = llm.chat(look_request()).await.unwrap_err();
+    assert!(err.0.contains("not configured for image input"), "{err}");
+
+    // Images only belong in user messages.
+    let misplaced = ChatRequest::new().message(Message {
+        role: MessageRole::Assistant,
+        parts: vec![Part::Image(tiny_png())],
+    });
+    let llm = Llm::new(OpenAiCompatLlm::new("http://127.0.0.1:9", "sk", "m").vision(true));
+    let err = llm.chat(misplaced).await.unwrap_err();
+    assert!(err.0.contains("only supported in user messages"), "{err}");
+    Ok(())
+}

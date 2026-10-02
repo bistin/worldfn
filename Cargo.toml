@@ -17,14 +17,14 @@ structured = ["dep:serde", "dep:serde_json", "dep:schemars"]
 # `CodexLlm`: calls the ChatGPT Codex backend with credentials written by the
 # official Codex CLI (`codex login`). Unofficial for third-party use; see
 # docs/providers.md before enabling.
-codex = ["http", "dep:base64"]
+codex = ["http"]
 # worldfn's own ChatGPT login for `CodexLlm` (browser PKCE or device code),
 # with token refresh, plus the `worldfn login codex` binary. Same caveats.
 codex-login = ["codex", "dep:sha2", "dep:getrandom", "dep:tokio"]
 # `OpenAiCompatLlm`: any OpenAI-compatible Chat Completions API
 # (OpenAI, DeepSeek, local servers) with an API key.
 openai-compat = ["http"]
-http = ["dep:reqwest", "dep:serde_json"]
+http = ["dep:reqwest", "dep:serde_json", "dep:base64"]
 
 [dependencies]
 base64 = { version = "0.22", optional = true }
@@ -57,6 +57,10 @@ required-features = ["http"]
 [[example]]
 name = "triage"
 test = true
+required-features = ["structured"]
+
+[[example]]
+name = "vision"
 required-features = ["structured"]
 
 [[example]]

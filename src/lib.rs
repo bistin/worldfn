@@ -66,6 +66,7 @@
 //! arity rules.
 
 mod agent;
+pub mod cancel;
 pub mod chat;
 mod context;
 pub mod emit;
@@ -90,7 +91,8 @@ mod world;
 pub use agent::{
     Agent, AgentFuture, AgentMeta, FunctionAgent, IntoAgent, IsAgent, IsFunctionAgent,
 };
-pub use chat::{ChatDelta, ChatRequest, ChatResponse, Message, OutputFormat};
+pub use cancel::{CancelToken, StopReason};
+pub use chat::{ChatDelta, ChatRequest, ChatResponse, Image, Message, OutputFormat};
 pub use context::{Context, ContextError, ContextSource, RelevantMemory};
 pub use emit::{Emit, EventStream, SseEvent, SseFrame};
 pub use error::{BindError, Check, Diagnostics, ParamError, ParamErrorKind, RunError};
@@ -105,7 +107,9 @@ pub use skills::{AsQuery, RelevantSkills, Skill, SkillCatalog, SkillLibrary, Ski
 pub use structured::StructuredError;
 pub use tool::{FakeTool, SearchHit, Tool, ToolError, ToolHandler, ToolSpec, WebSearch};
 #[cfg(feature = "structured")]
-pub use toolbox::{LoopEvent, ToolLoopError, ToolRun, Toolbox};
+pub use toolbox::{
+    LoopEvent, LoopLimit, LoopOptions, Observation, Observer, ToolLoopError, ToolRun, Toolbox,
+};
 pub use world::AgentWorld;
 
 /// A boxed, `Send` future, used at type-erased provider boundaries.

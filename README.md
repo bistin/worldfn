@@ -290,7 +290,7 @@ Setup, caveats, and the Codex terms risk are in
   sequentially. No benchmarks have been run yet.
 - **There is one `Llm` per world.** Several models would need marker-typed
   handles such as `Llm<Fast>`.
-- **Providers are minimal.** Two providers (Codex, OpenAI-compatible), no retries or backoff, no images.
+- **Providers are minimal.** Two providers (Codex, OpenAI-compatible), no retries or backoff.
 - **No capability enforcement, graphs, or scheduler.**
 
 Details: [`DESIGN.md`](DESIGN.md). Background and roadmap:

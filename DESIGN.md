@@ -196,6 +196,37 @@ approval before a tool runs or parallel calls, use `definitions` and
 Tool arguments must be JSON objects, so a non-object `Request` (e.g.
 `String`) is wrapped as `{"input": ...}` and unwrapped on dispatch.
 
+A `ToolSet` is a single tool or a tuple of 1 to 8 tool sets, so tuples nest:
+`Toolbox<((A, B, C, D, E), (F, G, H, I))>` is nine tools, still listed one by
+one in the agent's requirement tree, still one `AgentParam`.
+
+`Toolbox::run_with` takes `LoopOptions` for anything that runs unattended.
+The loop guarantees, with or without options:
+
+- **The model sees exactly the toolbox.** `request.tools` is replaced by the
+  toolbox's definitions; duplicate names fail before the first call
+  (`InvalidToolSurface`).
+- **A reply is checked before anything runs.** Tool calls need non-empty ids,
+  unique within the reply, since results are matched by id. Otherwise
+  `InvalidTurn`, and none of that reply's calls run.
+- **Only a complete answer ends a run.** No tool calls and `Stop` (or `Other`)
+  with non-empty text. A reply cut at the length limit, filtered, empty, or
+  claiming calls it did not make is `Unfinished`, never a result.
+- **The transcript is complete.** `ToolRun.request` ends with the final
+  answer, so it can be stored or continued as is.
+
+Options add budgets (tool calls per run and per reply, failed calls, the same
+call failing repeatedly), a cap on result size (cut with a note the model
+sees), a time limit, and a `CancelToken`. Every error carries the calls made
+so far (`ToolLoopError::calls`), a failed model call included, and the loop
+never repeats a tool; see `docs/vm-execution.md` for recovery, retry and
+cleanup rules. A reply cut off at the length limit or filtered runs none of
+its tool calls. An `Observer` sees each tool's full result, even when
+`max_result_bytes` cuts the copy the model sees. Deadlines and cancellation use `std` only
+(`worldfn::cancel`), like `Emit`. Stopping abandons the in-flight future at
+its next await point; work outside the process (a remote command) needs its
+own cleanup, which is the adapter's job.
+
 ### Streaming
 
 `LlmProvider::chat_streaming` takes a `&mut dyn FnMut(ChatDelta)` callback
@@ -246,7 +277,25 @@ oldest message changes each turn and the cached prefix stops at the system
 prompt. Dropping old tool outputs or screenshots to save context has the same
 effect; do it in large, rare steps rather than a little on every call.
 
-Still missing: images.
+### Images
+
+`Part::Image(Image)` carries PNG or JPEG bytes, validated on construction
+(type and dimensions from the header) and shared behind an `Arc`, so cloning a
+request with screenshots stays cheap; `Debug` never prints pixels. Images are
+allowed in user messages only. Codex sends them as `input_image` data URLs;
+OpenAI-compatible servers as `image_url` parts, only when the provider is
+configured with `.vision(true)` (default for `openai()`). Any other case fails
+the call instead of silently dropping the image, which `Message::text()` would
+otherwise do.
+
+Tools return text, so a screenshot tool returns metadata (artifact id, size,
+hash) and an `Observer` set in `LoopOptions`, which the host trusts, resolves
+it to pixels from its own store. The model can never make the host read a
+path. After all of a reply's calls have run, their images go into one user
+message labeled with the call ids, so every result still directly follows
+its call. `LoopOptions::max_images` bounds how many stay in the conversation;
+when exceeded, the oldest are replaced by a text note until half remain, in
+one step, so the cached prefix survives between prunes.
 
 ## Skills
 

@@ -103,7 +103,8 @@ fn now() -> u64 {
 
 fn access_token(account: &str, tag: &str) -> String {
     let claims = json!({
-        "exp": now() + 3600,
+        // Fixed (2100-01-01) so the same tag always yields the same token.
+        "exp": 4_102_444_800u64,
         "tag": tag,
         "https://api.openai.com/auth": { "chatgpt_account_id": account },
     });

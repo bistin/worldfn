@@ -1,6 +1,9 @@
 use serde_json::{Value, json};
 
-use super::{DeltaForwarder, error_for_status, http_client, read_sse, transport_error};
+use super::{
+    DeltaForwarder, data_url, error_for_status, http_client, read_sse, reject_misplaced_images,
+    transport_error,
+};
 use crate::chat::{
     ChatDelta, ChatRequest, ChatResponse, FinishReason, Message, MessageRole, OutputFormat, Part,
     ToolCall, Usage, json_instruction,
@@ -42,6 +45,7 @@ pub struct OpenAiCompatLlm {
     name: &'static str,
     json_mode: JsonMode,
     send_cache_key: bool,
+    vision: bool,
 }
 
 impl OpenAiCompatLlm {
@@ -62,6 +66,7 @@ impl OpenAiCompatLlm {
             name: "openai-compatible",
             json_mode: JsonMode::Instructions,
             send_cache_key: false,
+            vision: false,
         }
     }
 
@@ -83,6 +88,7 @@ impl OpenAiCompatLlm {
         llm.name = "openai";
         llm.json_mode = JsonMode::Schema;
         llm.send_cache_key = true;
+        llm.vision = true;
         Ok(llm)
     }
 
@@ -96,6 +102,15 @@ impl OpenAiCompatLlm {
     /// `Object` for [`deepseek`](Self::deepseek), `Instructions` otherwise.
     pub fn json_mode(mut self, mode: JsonMode) -> Self {
         self.json_mode = mode;
+        self
+    }
+
+    /// Whether the model takes image input. On by default only for
+    /// [`openai`](Self::openai): DeepSeek's chat models do not, and for other
+    /// servers it depends on the model. With it off, a request containing an
+    /// image fails instead of the image being dropped.
+    pub fn vision(mut self, enabled: bool) -> Self {
+        self.vision = enabled;
         self
     }
 
@@ -138,7 +153,14 @@ impl OpenAiCompatLlm {
             messages.push(json!({ "role": "system", "content": system }));
         }
         for message in &request.messages {
-            encode_message(message, &mut messages);
+            if !self.vision && message.images().next().is_some() {
+                return Err(LlmError(format!(
+                    "{}: this provider is not configured for image input \
+                     (use a vision model and call .vision(true))",
+                    self.name
+                )));
+            }
+            encode_message(self.name, message, &mut messages)?;
         }
 
         let mut body = json!({ "model": self.model, "messages": messages, "stream": false });
@@ -178,9 +200,28 @@ impl OpenAiCompatLlm {
     }
 }
 
-fn encode_message(message: &Message, out: &mut Vec<Value>) {
+fn encode_message(provider: &str, message: &Message, out: &mut Vec<Value>) -> Result<(), LlmError> {
+    reject_misplaced_images(provider, message)?;
     match message.role {
-        MessageRole::User => out.push(json!({ "role": "user", "content": message.text() })),
+        MessageRole::User if message.images().next().is_none() => {
+            out.push(json!({ "role": "user", "content": message.text() }));
+        }
+        MessageRole::User => {
+            // Text and images in their original order.
+            let content: Vec<Value> = message
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    Part::Text(text) => Some(json!({ "type": "text", "text": text })),
+                    Part::Image(image) => Some(json!({
+                        "type": "image_url",
+                        "image_url": { "url": data_url(image) },
+                    })),
+                    _ => None,
+                })
+                .collect();
+            out.push(json!({ "role": "user", "content": content }));
+        }
         MessageRole::Assistant => {
             let text = message.text();
             let mut encoded = json!({
@@ -219,6 +260,7 @@ fn encode_message(message: &Message, out: &mut Vec<Value>) {
             }
         }
     }
+    Ok(())
 }
 
 fn env_key(var: &str) -> Result<String, LlmError> {

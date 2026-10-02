@@ -19,7 +19,10 @@ use serde_json::{Value, json};
 
 #[cfg(test)]
 use super::SseFrames;
-use super::{DeltaForwarder, error_for_status, http_client, read_sse, transport_error};
+use super::{
+    DeltaForwarder, data_url, error_for_status, http_client, read_sse, reject_misplaced_images,
+    transport_error,
+};
 use crate::chat::{
     ChatDelta, ChatRequest, ChatResponse, FinishReason, Message, MessageRole, OutputFormat, Part,
     ToolCall, Usage, json_instruction,
@@ -181,7 +184,7 @@ impl CodexLlm {
 
         let mut input = Vec::new();
         for message in &request.messages {
-            encode_message(message, &mut input);
+            encode_message(message, &mut input)?;
         }
         let mut body = json!({
             "model": self.model,
@@ -225,13 +228,26 @@ impl CodexLlm {
     }
 }
 
-fn encode_message(message: &Message, out: &mut Vec<Value>) {
+fn encode_message(message: &Message, out: &mut Vec<Value>) -> Result<(), LlmError> {
+    reject_misplaced_images(PROVIDER, message)?;
     match message.role {
-        MessageRole::User => out.push(json!({
-            "type": "message",
-            "role": "user",
-            "content": [{ "type": "input_text", "text": message.text() }],
-        })),
+        MessageRole::User => {
+            // Text and images in their original order.
+            let content: Vec<Value> = message
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    Part::Text(text) => Some(json!({ "type": "input_text", "text": text })),
+                    Part::Image(image) => Some(json!({
+                        "type": "input_image",
+                        "detail": "auto",
+                        "image_url": data_url(image),
+                    })),
+                    _ => None,
+                })
+                .collect();
+            out.push(json!({ "type": "message", "role": "user", "content": content }));
+        }
         MessageRole::Assistant => {
             let text = message.text();
             if !text.is_empty() {
@@ -267,6 +283,7 @@ fn encode_message(message: &Message, out: &mut Vec<Value>) {
             }
         }
     }
+    Ok(())
 }
 
 enum Source {

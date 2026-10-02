@@ -152,6 +152,7 @@ Both providers take the full `ChatRequest`:
 | `tools` | `tools[].function` | `tools[]` (`type: function`) |
 | `OutputFormat::Json` | depends on `JsonMode` (below) | schema in `instructions`; `text.format` too with `.native_structured_output(true)` |
 | `max_output_tokens` | `max_tokens` | not sent (undocumented on the Codex backend) |
+| images (`Part::Image`, user messages) | `image_url` content parts, only with `.vision(true)` (default for `openai()`); otherwise the call fails | `input_image` (`detail: auto`) |
 | `cache_key` | `prompt_cache_key` only with `.send_cache_key(true)` (default for `openai()`) | `prompt_cache_key` |
 
 Replies come back as one assistant message with text and/or tool calls, a
@@ -200,7 +201,6 @@ status, the provider's error body, and a hint where one helps.
 ## Current limits
 
 - Tool calls within one model turn run sequentially in `Toolbox::run`.
-- No images.
 - A local server that rejects `stream_options` fails on `chat_streaming`;
   plain `chat` still works.
 - No retries or backoff.

@@ -28,19 +28,35 @@ none of its calls.
 ## 3. Recovery is the caller's decision
 
 After an error the caller has the completed calls and, through them, what
-changed. Choices, from safest:
+changed. Resetting the VM undoes only what happened **inside** the VM. A run
+can also change things outside it: a `git push`, an email, a payment, a call
+to an external API, a file on a shared mount. A reset does not undo those,
+and running again repeats them.
 
-1. **Reset and start over.** Restore the VM snapshot (or clone a fresh VM)
-   and run again from the task. Always correct; the default for the demo.
-2. **Report and stop.** Keep the evidence (calls, screenshots, logs) and do
-   not retry. For failures that need a human.
-3. **Continue the same conversation.** Only when every completed call is
-   accounted for in the transcript the model will see, so it knows what
-   already happened. Never re-send the original request as if nothing ran.
+So the first question is where the effects went:
 
-A call whose outcome is unknown (the connection dropped while a command was
-running) is reported as unknown. It is never assumed to have failed, and
-never assumed not to have run.
+1. **All effects stayed in the resettable environment** (the guest's disk,
+   processes and browser, with no outside writes): reset the VM (restore the
+   snapshot or clone a fresh one) and run again from the task. This is the
+   only case where re-running is safe without further checks.
+2. **An effect reached the outside world, or a call's outcome is unknown**
+   (the connection dropped mid-command): first check whether it happened,
+   against the outside system itself (is the commit on the remote, was the
+   email sent). Re-run only what is confirmed not to have happened. If it
+   cannot be confirmed, stop and report; do not re-run.
+3. **Continue the same conversation** only when every completed call is in
+   the transcript the model will see, so it knows what already happened.
+   Never re-send the original request as if nothing ran.
+
+To keep the demo in case 1, the demo VM has no outbound network except what
+setup explicitly allows (e.g. a local package cache), no host mounts and no
+credentials for outside services. A task that needs outside effects (pushing
+code, sending mail) is outside the first milestone; when one is added, its
+tool must say so in its contract, and the runner treats any run that called
+it as case 2.
+
+A call whose outcome is unknown is reported as unknown. It is never assumed
+to have failed, and never assumed not to have run.
 
 ## 4. Which actions may be retried
 
